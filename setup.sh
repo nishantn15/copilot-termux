@@ -30,11 +30,109 @@ case "$ARCH" in
     ;;
 esac
 
-# Install root: allow override with first argument, otherwise derive from npm global root
-if [ "${1:-}" != "" ]; then
-  INSTALL_ROOT="$1"
+# Permanent backup directory for native prebuilds (survives npm updates)
+BACKUP_DIR="$HOME/.copilot-termux-backups"
+
+# Parse arguments: --update for quick update mode, path for install root override
+UPDATE_MODE=false
+POSITIONAL_ARG=""
+for arg in "$@"; do
+  case "$arg" in
+    --update|-u) UPDATE_MODE=true ;;
+    *) POSITIONAL_ARG="$arg" ;;
+  esac
+done
+
+# Install root: allow override with positional argument, otherwise derive from npm global root
+if [ -n "$POSITIONAL_ARG" ]; then
+  INSTALL_ROOT="$POSITIONAL_ARG"
 else
   INSTALL_ROOT="${PREFIX}/lib/node_modules/@github/copilot"
+fi
+
+################################################################################
+# UPDATE MODE: Quick update that backs up prebuilds, runs npm update, restores
+#
+# Usage: ./setup.sh --update
+#
+# IMPORTANT LEARNINGS (Termux/Android):
+# - npm update/install of @github/copilot WIPES the prebuilds/ directory
+# - The package does NOT ship android-arm64 prebuilds (only darwin/linux/win)
+# - We must backup pty.node BEFORE update, then restore AFTER
+# - The pty.node binary is arch-specific (ELF aarch64 for Android 24+)
+# - Without pty.node, Copilot fails with: "Failed to load native module: pty.node"
+################################################################################
+
+if [ "$UPDATE_MODE" = true ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════"
+  echo "  Copilot Termux Quick Update ($ANDROID_ARCH)"
+  echo "═══════════════════════════════════════════════════════════"
+  echo ""
+
+  OLD_VERSION=$(npm list -g @github/copilot 2>/dev/null | grep copilot | sed 's/.*@//' || echo "unknown")
+  echo "ℹ Current version: $OLD_VERSION"
+
+  LATEST_VERSION=$(npm view @github/copilot version 2>/dev/null || echo "unknown")
+  echo "ℹ Latest available: $LATEST_VERSION"
+
+  if [ "$OLD_VERSION" = "$LATEST_VERSION" ]; then
+    echo "✓ Already up to date ($OLD_VERSION)"
+    exit 0
+  fi
+
+  # Step 1: Backup android prebuild
+  mkdir -p "$BACKUP_DIR"
+  PTY_SRC="$INSTALL_ROOT/prebuilds/$ANDROID_ARCH/pty.node"
+  PTY_BACKUP="$BACKUP_DIR/pty.node.$ANDROID_ARCH"
+
+  if [ -f "$PTY_SRC" ]; then
+    cp "$PTY_SRC" "$PTY_BACKUP"
+    echo "✓ Backed up pty.node to $PTY_BACKUP"
+  elif [ -f "$PTY_BACKUP" ]; then
+    echo "ℹ Using existing permanent backup at $PTY_BACKUP"
+  else
+    echo "⚠ No pty.node found to backup — will try to build after update"
+  fi
+
+  # Step 2: Run npm update
+  echo ""
+  echo "▶ Updating @github/copilot..."
+  if npm update -g @github/copilot; then
+    echo "✓ npm update succeeded"
+  else
+    echo "✗ npm update failed"
+    exit 1
+  fi
+
+  # Step 3: Restore android prebuild (npm wipes it!)
+  PREBUILD_DIR="$INSTALL_ROOT/prebuilds/$ANDROID_ARCH"
+  mkdir -p "$PREBUILD_DIR"
+
+  if [ -f "$PTY_BACKUP" ]; then
+    cp "$PTY_BACKUP" "$PREBUILD_DIR/pty.node"
+    echo "✓ Restored pty.node to $PREBUILD_DIR/pty.node"
+  else
+    echo "⚠ No pty.node backup available — attempting rebuild..."
+    cd "$INSTALL_ROOT"
+    if npm install node-pty 2>/dev/null && [ -f "node_modules/node-pty/build/Release/pty.node" ]; then
+      cp "node_modules/node-pty/build/Release/pty.node" "$PREBUILD_DIR/pty.node"
+      cp "$PREBUILD_DIR/pty.node" "$PTY_BACKUP" 2>/dev/null || true
+      echo "✓ Rebuilt and installed pty.node"
+    else
+      echo "✗ Failed to rebuild pty.node — run full setup: ./setup.sh"
+      exit 1
+    fi
+  fi
+
+  # Step 4: Verify
+  NEW_VERSION=$(copilot --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
+  echo ""
+  echo "═══════════════════════════════════════════════════════════"
+  echo "  ✓ Updated: $OLD_VERSION → $NEW_VERSION"
+  echo "═══════════════════════════════════════════════════════════"
+  echo ""
+  exit 0
 fi
 
 # Color codes for output
@@ -560,6 +658,12 @@ PTY_PATH="$INSTALL_ROOT/node_modules/node-pty/build/Release/pty.node"
 
 [ -f "$KEYTAR_PATH" ] && ln -sf "$KEYTAR_PATH" "prebuilds/$ANDROID_ARCH/keytar.node" && print_success "keytar.node symlinked" || { print_error "keytar.node not found"; exit 1; }
 [ -f "$PTY_PATH" ] && ln -sf "$PTY_PATH" "prebuilds/$ANDROID_ARCH/pty.node" && print_success "pty.node symlinked" || { print_error "pty.node not found"; exit 1; }
+
+# Save permanent backups so future --update can restore without rebuilding
+mkdir -p "$BACKUP_DIR"
+[ -f "$KEYTAR_PATH" ] && cp "$KEYTAR_PATH" "$BACKUP_DIR/keytar.node.$ANDROID_ARCH" && print_success "keytar.node permanent backup saved"
+[ -f "$PTY_PATH" ] && cp "$PTY_PATH" "$BACKUP_DIR/pty.node.$ANDROID_ARCH" && print_success "pty.node permanent backup saved"
+print_info "Permanent backups at $BACKUP_DIR (survive npm updates)"
 
 print_step "Step 11/11: Verifying installation"
 
