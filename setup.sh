@@ -43,11 +43,14 @@ for arg in "$@"; do
   esac
 done
 
-# Install root: allow override with positional argument, otherwise derive from npm global root
+# Install root: allow override with positional argument, otherwise auto-detect from npm
 if [ -n "$POSITIONAL_ARG" ]; then
   INSTALL_ROOT="$POSITIONAL_ARG"
 else
-  INSTALL_ROOT="${PREFIX}/lib/node_modules/@github/copilot"
+  # Auto-detect: use npm root -g to find the actual global modules path
+  # (handles custom prefix in ~/.npmrc e.g. ~/.npm-global)
+  NPM_GLOBAL_ROOT="$(npm root -g 2>/dev/null || echo "${PREFIX}/lib/node_modules")"
+  INSTALL_ROOT="${NPM_GLOBAL_ROOT}/@github/copilot"
 fi
 
 ################################################################################
