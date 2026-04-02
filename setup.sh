@@ -99,9 +99,11 @@ if [ "$UPDATE_MODE" = true ]; then
   fi
 
   # Step 2: Run npm update
+  # Use --force to bypass platform checks (e.g. @openai/codex requires os:linux
+  # but Termux reports os:android — --force skips that validation)
   echo ""
   echo "▶ Updating @github/copilot..."
-  if npm update -g @github/copilot; then
+  if npm update -g @github/copilot --force 2>&1 | grep -v "^npm warn using --force"; then
     echo "✓ npm update succeeded"
   else
     echo "✗ npm update failed"
