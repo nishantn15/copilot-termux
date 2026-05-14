@@ -130,49 +130,8 @@ if [ "$UPDATE_MODE" = true ]; then
     fi
   fi
 
-  # Step 4: Patch native runtime for Android (required since 1.0.46+)
-  # @github/copilot 1.0.46 introduced native/runtime/ (Rust napi-rs binding) with no
-  # Android target. We patch the musl variant to work on bionic via patchelf + LD_PRELOAD shim.
-  RT_DIR="$INSTALL_ROOT/native/runtime"
-  RT_MUSL="$RT_DIR/runtime.linux-arm64-musl.node"
-  RT_TARGET="$RT_DIR/runtime.android-arm64.node"
-  SHIM_DIR="$HOME/.copilot-versions/shim"
-  SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
-
-  if [ -d "$RT_DIR" ] && [ -f "$RT_MUSL" ]; then
-    # Ensure patchelf is available
-    if ! command -v patchelf >/dev/null 2>&1; then
-      echo "✗ patchelf required for native runtime patch. Install: pkg install patchelf"
-      exit 1
-    fi
-
-    cp -f "$RT_MUSL" "$RT_TARGET"
-    if patchelf --add-needed libm.so "$RT_TARGET"; then
-      echo "✓ Patched native runtime (android-arm64)"
-    else
-      echo "✗ Failed to patch native runtime"
-      exit 1
-    fi
-
-    # Ensure bionic shim exists (needed for LD_PRELOAD at runtime)
-    if [ ! -f "$SHIM_LIB" ]; then
-      if [ -f "$SHIM_DIR/bionic_shim.c" ] && command -v clang >/dev/null 2>&1; then
-        clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
-          -o "$SHIM_LIB" "$SHIM_DIR/bionic_shim.c" 2>/dev/null
-        echo "✓ Rebuilt bionic shim"
-      else
-        echo "⚠ Bionic shim missing — copilot wrapper will attempt rebuild on first launch"
-      fi
-    fi
-
-    # Warn if wrapper is missing
-    if [ ! -x "$HOME/.local/bin/copilot" ]; then
-      echo "⚠ Copilot wrapper missing at ~/.local/bin/copilot — native runtime needs LD_PRELOAD"
-    fi
-  fi
-
-  # Step 5: Verify
-  NEW_VERSION=$("$HOME/.local/bin/copilot" --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
+  # Step 4: Verify
+  NEW_VERSION=$(copilot --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
   echo ""
   echo "═══════════════════════════════════════════════════════════"
   echo "  ✓ Updated: $OLD_VERSION → $NEW_VERSION"
@@ -306,7 +265,7 @@ fi
 # STEP 1: Ensure GitHub Copilot CLI installed globally
 ################################################################################
 
-print_step "Step 1/13: Installing GitHub Copilot CLI globally"
+print_step "Step 1/10: Installing GitHub Copilot CLI globally"
 
 print_info "Running npm install -g @github/copilot to ensure CLI is present"
 if npm install -g @github/copilot; then
@@ -323,7 +282,7 @@ fi
 
 cd "$INSTALL_ROOT"
 
-print_step "Step 2/13: Installing system dependencies"
+print_step "Step 2/10: Installing system dependencies"
 
 ensure_pkg glib
 ensure_pkg xorgproto
@@ -378,7 +337,7 @@ else
     print_warning "No system rg found; Copilot may fail to use ripgrep"
 fi
 
-print_step "Step 3/13: Installing node-pty"
+print_step "Step 3/10: Installing node-pty"
 
 if npm install node-pty; then
     print_success "node-pty installed successfully"
@@ -395,7 +354,7 @@ else
     exit 1
 fi
 
-print_step "Step 4/13: Installing node-addon-api and keytar"
+print_step "Step 4/10: Installing node-addon-api and keytar"
 
 npm install node-addon-api@latest --save-dev
 if npm install keytar --ignore-scripts; then
@@ -406,7 +365,7 @@ else
 fi
 
 
-print_step "Step 5/13: Patching node-addon-api enum handling"
+print_step "Step 5/10: Patching node-addon-api enum handling"
 find node_modules -name "napi.h" | while read -r NAPI_HEADER; do
     if grep -q "static_cast<napi_typedarray_type>(-1)" "$NAPI_HEADER"; then
         cp "$NAPI_HEADER" "$NAPI_HEADER.backup"
@@ -418,7 +377,7 @@ find node_modules -name "napi.h" | while read -r NAPI_HEADER; do
     fi
 done
 
-print_step "Step 6/13: Installing sharp"
+print_step "Step 6/10: Installing sharp"
 if npm install sharp; then
     print_success "sharp installed and compiled successfully"
 else
@@ -426,7 +385,7 @@ else
     print_warning "Copilot CLI will work but without image processing features"
 fi
 
-print_step "Step 7/13: Building keytar with patched dependencies"
+print_step "Step 7/10: Building keytar with patched dependencies"
 
 cd node_modules/keytar
 
@@ -440,10 +399,10 @@ fi
 
 cd ../..
 
-print_step "Step 8/13: Installing termux-api for clipboard support"
+print_step "Step 8/10: Installing termux-api for clipboard support"
 ensure_pkg termux-api termux-clipboard-get
 
-print_step "Step 9/13: Setting up clipboard (Termux API wrapper)"
+print_step "Step 9/10: Setting up clipboard (Termux API wrapper)"
 if [ ! -f "clipboard/index.cjs" ] || [ ! -f "clipboard/android-impl.cjs" ]; then
     mkdir -p clipboard
     if [ ! -f "clipboard/index.cjs" ]; then
@@ -696,7 +655,7 @@ fi
 npm install @teddyzhu/clipboard --ignore-scripts 2>/dev/null || true
 [ -f "clipboard/index.cjs" ] && print_success "Clipboard wrapper installed" || print_warning "Clipboard wrapper not found"
 
-print_step "Step 10/13: Symlinking compiled binaries to prebuilds directory"
+print_step "Step 10/11: Symlinking compiled binaries to prebuilds directory"
 
 mkdir -p "prebuilds/$ANDROID_ARCH"
 KEYTAR_PATH="$INSTALL_ROOT/node_modules/keytar/build/Release/keytar.node"
@@ -711,144 +670,7 @@ mkdir -p "$BACKUP_DIR"
 [ -f "$PTY_PATH" ] && cp "$PTY_PATH" "$BACKUP_DIR/pty.node.$ANDROID_ARCH" && print_success "pty.node permanent backup saved"
 print_info "Permanent backups at $BACKUP_DIR (survive npm updates)"
 
-print_step "Step 11/13: Installing native runtime patch (1.0.46+ compat)"
-
-# @github/copilot 1.0.46 introduced native/runtime/ (Rust napi-rs binding) with no Android target.
-# We create a bionic compatibility shim and patch the musl binary to work on Android.
-ensure_pkg patchelf patchelf
-
-SHIM_DIR="$HOME/.copilot-versions/shim"
-SHIM_SRC="$SHIM_DIR/bionic_shim.c"
-SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
-RT_DIR="$INSTALL_ROOT/native/runtime"
-RT_MUSL="$RT_DIR/runtime.linux-arm64-musl.node"
-RT_TARGET="$RT_DIR/runtime.android-arm64.node"
-
-mkdir -p "$SHIM_DIR"
-
-# Write bionic shim source if not present
-if [ ! -f "$SHIM_SRC" ]; then
-  cat > "$SHIM_SRC" << 'SHIMEOF'
-#include <string.h>
-#include <stddef.h>
-#include <errno.h>
-
-/* bcmp: deprecated POSIX function. musl libc still uses it; bionic doesn't export it. */
-int bcmp(const void *s1, const void *s2, size_t n) {
-    return memcmp(s1, s2, n);
-}
-
-/* __xpg_strerror_r: glibc/musl's XPG-compliant int-returning strerror_r alias.
- * Bionic only exports the POSIX strerror_r (int return), so forward to it. */
-extern int strerror_r(int, char *, size_t);
-int __xpg_strerror_r(int errnum, char *buf, size_t buflen) {
-    return strerror_r(errnum, buf, buflen);
-}
-
-/* __errno_location: glibc/musl use this name; bionic exports __errno() returning the same. */
-extern int *__errno(void);
-int *__errno_location(void) {
-    return __errno();
-}
-SHIMEOF
-  print_success "Created bionic shim source"
-fi
-
-# Compile shim
-if [ ! -f "$SHIM_LIB" ] || [ "$SHIM_SRC" -nt "$SHIM_LIB" ]; then
-  if clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
-      -o "$SHIM_LIB" "$SHIM_SRC"; then
-    print_success "Compiled bionic shim → $SHIM_LIB"
-  else
-    print_error "Failed to compile bionic shim"
-  fi
-else
-  print_info "Bionic shim already compiled"
-fi
-
-# Patch native runtime
-if [ -d "$RT_DIR" ] && [ -f "$RT_MUSL" ]; then
-  cp -f "$RT_MUSL" "$RT_TARGET"
-  if patchelf --add-needed libm.so "$RT_TARGET"; then
-    print_success "Patched native runtime → runtime.android-arm64.node"
-  else
-    print_error "Failed to patchelf native runtime"
-  fi
-else
-  print_warning "native/runtime/ not found — may not be needed for this version"
-fi
-
-print_step "Step 12/13: Installing copilot wrapper (LD_PRELOAD launcher)"
-
-# The wrapper ensures LD_PRELOAD is set for the bionic shim and self-heals if
-# npm update wipes the patched runtime. Must be in PATH before ~/.npm-global/bin.
-WRAPPER_DIR="$HOME/.local/bin"
-WRAPPER_PATH="$WRAPPER_DIR/copilot"
-mkdir -p "$WRAPPER_DIR"
-
-cat > "$WRAPPER_PATH" << 'WRAPEOF'
-#!/usr/bin/env bash
-# GitHub Copilot CLI launcher with Termux/bionic compat patches.
-# Background: 1.0.46 introduced @copilot/runtime-native (Rust napi-rs binding) used by
-# MCP config + session FS. Its build matrix has no Android target. Two patches restore it:
-#   1. LD_PRELOAD libbionic_shim.so — shims bcmp/__xpg_strerror_r/__errno_location.
-#   2. native/runtime/runtime.android-arm64.node — a patchelf'd copy of the musl variant
-#      with libm.so added as NEEDED (bionic separates libc/libm; musl bundles them).
-# If npm reinstalls @github/copilot, runtime.android-arm64.node is wiped — this wrapper
-# self-heals on launch.
-
-SHIM_DIR="$HOME/.copilot-versions/shim"
-SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
-COPILOT_PKG="$HOME/.npm-global/lib/node_modules/@github/copilot"
-RT_DIR="$COPILOT_PKG/native/runtime"
-RT_TARGET="$RT_DIR/runtime.android-arm64.node"
-RT_SRC="$RT_DIR/runtime.linux-arm64-musl.node"
-NPM_LOADER="$COPILOT_PKG/npm-loader.js"
-
-# Self-heal: rebuild patched runtime if missing or stale.
-if [ ! -f "$RT_TARGET" ] || [ "$RT_SRC" -nt "$RT_TARGET" ]; then
-    if [ -f "$RT_SRC" ]; then
-        cp -f "$RT_SRC" "$RT_TARGET"
-        patchelf --add-needed libm.so "$RT_TARGET" 2>/dev/null
-    else
-        echo "[copilot-wrapper] runtime musl source missing: $RT_SRC" >&2
-        echo "[copilot-wrapper] You likely have an incompatible copilot version." >&2
-    fi
-fi
-
-# Self-heal: rebuild shim if missing.
-if [ ! -f "$SHIM_LIB" ]; then
-    if [ -f "$SHIM_DIR/bionic_shim.c" ] && command -v clang >/dev/null 2>&1; then
-        clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
-            -o "$SHIM_LIB" "$SHIM_DIR/bionic_shim.c" 2>/dev/null
-    fi
-fi
-
-# Compose LD_PRELOAD without nuking caller's value.
-if [ -f "$SHIM_LIB" ]; then
-    if [ -n "${LD_PRELOAD:-}" ]; then
-        export LD_PRELOAD="$SHIM_LIB:$LD_PRELOAD"
-    else
-        export LD_PRELOAD="$SHIM_LIB"
-    fi
-fi
-
-exec /data/data/com.termux/files/usr/bin/node "$NPM_LOADER" "$@"
-WRAPEOF
-
-chmod +x "$WRAPPER_PATH"
-print_success "Installed copilot wrapper → $WRAPPER_PATH"
-
-# Ensure ~/.local/bin is in PATH (add to .bashrc if not already there)
-if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-  if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-    print_info "Added ~/.local/bin to PATH in .bashrc"
-  fi
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-
-print_step "Step 13/13: Verifying installation"
+print_step "Step 11/11: Verifying installation"
 
 cat > test-native-modules-install.mjs << 'TESTEOF'
 import { createRequire } from 'module';
@@ -916,7 +738,7 @@ print_header "Installation Summary"
 echo "Installed Packages:"
 echo "  • nodejs, clang, make, python"
 echo "  • glib, xorgproto, rust, libvips, pkg-config"
-echo "  • ripgrep, termux-api, patchelf"
+echo "  • ripgrep, termux-api"
 echo ""
 echo "Native Modules Built:"
 echo "  • keytar (credential storage)"
@@ -924,15 +746,8 @@ echo "  • node-pty (terminal/command execution)"
 echo "  • sharp (image processing)"
 echo "  • clipboard wrapper (Termux API integration)"
 echo ""
-echo "Runtime Patches Applied:"
-echo "  • Bionic shim (bcmp/__xpg_strerror_r/__errno_location)"
-echo "  • native/runtime/runtime.android-arm64.node (patchelf'd musl → bionic)"
-echo "  • Self-healing wrapper at ~/.local/bin/copilot"
-echo ""
 echo "Modified Files:"
 echo "  • ~/.gyp/include.gypi (node-gyp config)"
-echo "  • ~/.copilot-versions/shim/ (bionic compat shim)"
-echo "  • ~/.local/bin/copilot (launcher wrapper)"
 echo "  • Patched node-addon-api enum handling"
 echo "  • Created clipboard/index.cjs and clipboard/android-impl.cjs"
 echo "  • Symlinked prebuilds/$ANDROID_ARCH/keytar.node"
@@ -941,9 +756,6 @@ echo "  • Symlinked ripgrep to Copilot expected path"
 echo ""
 
 print_header "Installation Complete!"
-echo "Run 'copilot' to start (uses wrapper at ~/.local/bin/copilot)"
-echo "Run './setup.sh --update' anytime to update to the latest version"
-echo ""
 
 echo "GitHub Copilot CLI is ready on Android/Termux ($ANDROID_ARCH)"
 echo ""
