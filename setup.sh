@@ -130,8 +130,49 @@ if [ "$UPDATE_MODE" = true ]; then
     fi
   fi
 
-  # Step 4: Verify
-  NEW_VERSION=$(copilot --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
+  # Step 4: Patch native runtime for Android (required since 1.0.46+)
+  # @github/copilot 1.0.46 introduced native/runtime/ (Rust napi-rs binding) with no
+  # Android target. We patch the musl variant to work on bionic via patchelf + LD_PRELOAD shim.
+  RT_DIR="$INSTALL_ROOT/native/runtime"
+  RT_MUSL="$RT_DIR/runtime.linux-arm64-musl.node"
+  RT_TARGET="$RT_DIR/runtime.android-arm64.node"
+  SHIM_DIR="$HOME/.copilot-versions/shim"
+  SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
+
+  if [ -d "$RT_DIR" ] && [ -f "$RT_MUSL" ]; then
+    # Ensure patchelf is available
+    if ! command -v patchelf >/dev/null 2>&1; then
+      echo "✗ patchelf required for native runtime patch. Install: pkg install patchelf"
+      exit 1
+    fi
+
+    cp -f "$RT_MUSL" "$RT_TARGET"
+    if patchelf --add-needed libm.so "$RT_TARGET"; then
+      echo "✓ Patched native runtime (android-arm64)"
+    else
+      echo "✗ Failed to patch native runtime"
+      exit 1
+    fi
+
+    # Ensure bionic shim exists (needed for LD_PRELOAD at runtime)
+    if [ ! -f "$SHIM_LIB" ]; then
+      if [ -f "$SHIM_DIR/bionic_shim.c" ] && command -v clang >/dev/null 2>&1; then
+        clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
+          -o "$SHIM_LIB" "$SHIM_DIR/bionic_shim.c" 2>/dev/null
+        echo "✓ Rebuilt bionic shim"
+      else
+        echo "⚠ Bionic shim missing — copilot wrapper will attempt rebuild on first launch"
+      fi
+    fi
+
+    # Warn if wrapper is missing
+    if [ ! -x "$HOME/.local/bin/copilot" ]; then
+      echo "⚠ Copilot wrapper missing at ~/.local/bin/copilot — native runtime needs LD_PRELOAD"
+    fi
+  fi
+
+  # Step 5: Verify
+  NEW_VERSION=$("$HOME/.local/bin/copilot" --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
   echo ""
   echo "═══════════════════════════════════════════════════════════"
   echo "  ✓ Updated: $OLD_VERSION → $NEW_VERSION"
