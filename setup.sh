@@ -130,45 +130,101 @@ if [ "$UPDATE_MODE" = true ]; then
     fi
   fi
 
-  # Step 4: Patch native runtime for Android (required since 1.0.46+)
-  # @github/copilot 1.0.46 introduced native/runtime/ (Rust napi-rs binding) with no
-  # Android target. We patch the musl variant to work on bionic via patchelf + LD_PRELOAD shim.
-  RT_DIR="$INSTALL_ROOT/native/runtime"
-  RT_MUSL="$RT_DIR/runtime.linux-arm64-musl.node"
-  RT_TARGET="$RT_DIR/runtime.android-arm64.node"
+  # Step 4: Patch native runtime + JS platform allowlist (required since 1.0.46+)
+  #
+  # 1.0.46–1.0.47 layout:
+  #   native/runtime/runtime.<plat>-<libc>.node — musl variant shipped.
+  #   Patch: copy musl→android-arm64, patchelf --add-needed libm.so.
+  #
+  # 1.0.48+ layout:
+  #   prebuilds/<plat>/runtime.node — glibc-only, depends on libgcc_s/libpthread/libdl.
+  #   Patch: copy linux-arm64→android-arm64, strip GLIBC symbol versions
+  #          (python3 strip_verneed.py), remove libgcc_s/libpthread/libdl NEEDED,
+  #          rename libc.so.6→libc.so / libm.so.6→libm.so.
+  #   Also: index.js + app.js have a libc-variant helper that throws
+  #         "Unsupported platform" on android — patch via patch_js.py.
+  #
+  # Both layouts need the LD_PRELOAD shim (libbionic_shim.so) at runtime to
+  # provide bcmp, __xpg_strerror_r, __errno_location, __xstat64-family,
+  # __assert_fail, __ctype_b_loc, and statically-linked _Unwind_*.
+
   SHIM_DIR="$HOME/.copilot-versions/shim"
   SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
+  SHIM_SRC="$SHIM_DIR/bionic_shim.c"
+  STRIP_PY="$SHIM_DIR/strip_verneed.py"
+  PATCH_JS_PY="$SHIM_DIR/patch_js.py"
+  LIBUNWIND="/data/data/com.termux/files/usr/lib/libunwind.a"
 
-  if [ -d "$RT_DIR" ] && [ -f "$RT_MUSL" ]; then
-    # Ensure patchelf is available
-    if ! command -v patchelf >/dev/null 2>&1; then
-      echo "✗ patchelf required for native runtime patch. Install: pkg install patchelf"
-      exit 1
-    fi
-
-    cp -f "$RT_MUSL" "$RT_TARGET"
-    if patchelf --add-needed libm.so "$RT_TARGET"; then
-      echo "✓ Patched native runtime (android-arm64)"
+  # ---- Build / refresh the shim ----
+  if ! command -v clang >/dev/null 2>&1; then
+    echo "⚠ clang missing — skipping shim rebuild"
+  elif [ ! -f "$SHIM_LIB" ] || [ "$SHIM_SRC" -nt "$SHIM_LIB" ]; then
+    if [ -f "$LIBUNWIND" ]; then
+      clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
+        -Wl,--whole-archive "$LIBUNWIND" -Wl,--no-whole-archive \
+        -o "$SHIM_LIB" "$SHIM_SRC" 2>/dev/null
+      for sym in _Unwind_Backtrace _Unwind_DeleteException _Unwind_FindEnclosingFunction \
+                 _Unwind_ForcedUnwind _Unwind_GetCFA _Unwind_GetDataRelBase _Unwind_GetGR \
+                 _Unwind_GetIP _Unwind_GetIPInfo _Unwind_GetLanguageSpecificData \
+                 _Unwind_GetRegionStart _Unwind_GetTextRelBase _Unwind_RaiseException \
+                 _Unwind_Resume _Unwind_Resume_or_Rethrow _Unwind_SetGR _Unwind_SetIP; do
+        llvm-objcopy --globalize-symbol="$sym" --set-symbol-visibility="$sym"=default \
+          "$SHIM_LIB" 2>/dev/null
+      done
+      echo "✓ Rebuilt bionic shim (with libunwind)"
     else
-      echo "✗ Failed to patch native runtime"
+      clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
+        -o "$SHIM_LIB" "$SHIM_SRC" 2>/dev/null
+      echo "✓ Rebuilt bionic shim (no libunwind — 1.0.48+ needs it; pkg install ndk-sysroot)"
+    fi
+  fi
+
+  if ! command -v patchelf >/dev/null 2>&1; then
+    echo "✗ patchelf required. Install: pkg install patchelf"
+    exit 1
+  fi
+
+  # ---- Layout detection + runtime patching ----
+  NEW_SRC="$INSTALL_ROOT/prebuilds/linux-arm64/runtime.node"
+  OLD_SRC="$INSTALL_ROOT/native/runtime/runtime.linux-arm64-musl.node"
+
+  if [ -f "$NEW_SRC" ]; then
+    # 1.0.48+ layout
+    if [ ! -f "$STRIP_PY" ]; then
+      echo "✗ strip_verneed.py missing at $STRIP_PY — run full setup first"
       exit 1
     fi
+    DST_DIR="$INSTALL_ROOT/prebuilds/$ANDROID_ARCH"
+    DST="$DST_DIR/runtime.node"
+    mkdir -p "$DST_DIR"
+    cp -f "$NEW_SRC" "$DST"
+    python3 "$STRIP_PY" "$DST" >/dev/null
+    patchelf --remove-needed libgcc_s.so.1 "$DST" 2>/dev/null
+    patchelf --remove-needed libpthread.so.0 "$DST" 2>/dev/null
+    patchelf --remove-needed libdl.so.2 "$DST" 2>/dev/null
+    patchelf --replace-needed libc.so.6 libc.so "$DST" 2>/dev/null
+    patchelf --replace-needed libm.so.6 libm.so "$DST" 2>/dev/null
+    echo "✓ Patched runtime.node ($ANDROID_ARCH, 1.0.48+ layout)"
 
-    # Ensure bionic shim exists (needed for LD_PRELOAD at runtime)
-    if [ ! -f "$SHIM_LIB" ]; then
-      if [ -f "$SHIM_DIR/bionic_shim.c" ] && command -v clang >/dev/null 2>&1; then
-        clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
-          -o "$SHIM_LIB" "$SHIM_DIR/bionic_shim.c" 2>/dev/null
-        echo "✓ Rebuilt bionic shim"
-      else
-        echo "⚠ Bionic shim missing — copilot wrapper will attempt rebuild on first launch"
-      fi
+    if [ -f "$PATCH_JS_PY" ]; then
+      python3 "$PATCH_JS_PY" "$INSTALL_ROOT" >/dev/null
+      echo "✓ Patched index.js + app.js Unsupported-platform throw"
+    else
+      echo "⚠ patch_js.py missing — copilot will throw 'Unsupported platform: android/arm64' until you create it"
     fi
+  elif [ -f "$OLD_SRC" ]; then
+    # 1.0.46–1.0.47 layout
+    DST="$INSTALL_ROOT/native/runtime/runtime.android-arm64.node"
+    cp -f "$OLD_SRC" "$DST"
+    patchelf --add-needed libm.so "$DST"
+    echo "✓ Patched runtime.android-arm64.node (1.0.46/47 layout)"
+  else
+    echo "ℹ No native runtime to patch (pre-1.0.46 or future layout — check $INSTALL_ROOT)"
+  fi
 
-    # Warn if wrapper is missing
-    if [ ! -x "$HOME/.local/bin/copilot" ]; then
-      echo "⚠ Copilot wrapper missing at ~/.local/bin/copilot — native runtime needs LD_PRELOAD"
-    fi
+  # Warn if wrapper is missing
+  if [ ! -x "$HOME/.local/bin/copilot" ]; then
+    echo "⚠ Copilot wrapper missing at ~/.local/bin/copilot — native runtime needs LD_PRELOAD"
   fi
 
   # Step 5: Verify

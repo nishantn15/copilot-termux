@@ -4,11 +4,20 @@ Run **GitHub Copilot CLI** (`@github/copilot`) natively on Android via [Termux](
 
 ## The Problem
 
-The official `@github/copilot` npm package doesn't support Android. Three things break:
+The official `@github/copilot` npm package doesn't support Android. Multiple things break, and they keep moving as upstream restructures:
 
 1. **node-pty** — no `android-arm64` prebuild ships; npm update wipes any manually-placed binary
 2. **Platform check** — `@openai/codex` dependency declares `os:linux`; Termux reports `android`
-3. **Native runtime (v1.0.46+)** — Rust napi-rs binding at `native/runtime/` has no Android target in its build matrix; on launch it throws "Cannot find native binding"
+3. **Native runtime (v1.0.46+)** — Rust napi-rs binding has no Android target in its build matrix; on launch it throws "Cannot find native binding"
+4. **JS platform allowlist (v1.0.48+)** — `index.js`/`app.js` libc-variant helper throws `Unsupported platform: android/arm64` before the native binding is even looked up
+
+### Layout shifts between versions
+
+| Version | Where runtime binding lives             | libc variant shipped | JS throws on android? |
+|---------|------------------------------------------|----------------------|------------------------|
+| 1.0.45  | (no native binding — pure JS)            | n/a                  | no                     |
+| 1.0.46–1.0.47 | `native/runtime/runtime.<plat>-<libc>.node` | gnu **+ musl**       | no                     |
+| 1.0.48+ | `prebuilds/<plat>/runtime.node`          | **gnu only**         | yes                    |
 
 ## The Solution
 
@@ -23,9 +32,11 @@ This repo provides a single `setup.sh` that:
 |-------|-----|
 | Missing `prebuilds/android-arm64/pty.node` | Build from source on first install; backup/restore on updates |
 | `os:linux` platform check rejects `android` | `npm update --force` bypasses validation |
-| `native/runtime/` no Android target | Copy `runtime.linux-arm64-musl.node` → `runtime.android-arm64.node` + `patchelf --add-needed libm.so` |
-| musl symbols missing on bionic | LD_PRELOAD shim exports `bcmp`, `__xpg_strerror_r`, `__errno_location` |
-| npm update wipes all patches | Self-healing wrapper at `~/.local/bin/copilot` rebuilds on launch |
+| 1.0.46/47 `native/runtime/` no Android target | Copy musl variant → `runtime.android-arm64.node` + `patchelf --add-needed libm.so` |
+| 1.0.48+ `prebuilds/linux-arm64/runtime.node` is glibc-only | Copy to `prebuilds/android-arm64/runtime.node`, strip GLIBC symbol versions (`strip_verneed.py`), drop `libgcc_s`/`libpthread`/`libdl` NEEDED, rename `libc.so.6→libc.so`, `libm.so.6→libm.so` |
+| 1.0.48+ JS throws "Unsupported platform" | `patch_js.py` rewrites the `default:throw` in `index.js`+`app.js` to fall through |
+| musl/glibc symbols missing on bionic | LD_PRELOAD shim exports `bcmp`, `__xpg_strerror_r`, `__errno_location`, `__xstat64`/`__lxstat64`/`__fxstat64`/`__fxstatat64`, `__ctype_b_loc`, `__assert_fail`, and statically-linked `_Unwind_*` (from Termux `libunwind.a`) |
+| npm update wipes all patches | Self-healing wrapper at `~/.local/bin/copilot` re-applies on launch |
 
 ## Prerequisites
 
@@ -151,7 +162,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → 1.0.47
+- `@github/copilot` 1.0.45 → 1.0.48 (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 
