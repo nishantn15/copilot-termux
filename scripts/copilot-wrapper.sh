@@ -24,6 +24,8 @@ PATCH_JS_PY="$SHIM_DIR/patch_js.py"
 COPILOT_PKG="$HOME/.npm-global/lib/node_modules/@github/copilot"
 NPM_LOADER="$COPILOT_PKG/npm-loader.js"
 LIBUNWIND="/data/data/com.termux/files/usr/lib/libunwind.a"
+PTY_BACKUP_DIR="$HOME/.copilot-termux-backups"
+ANDROID_ARCH="android-arm64"  # TODO: detect from uname -m for non-arm64 hosts
 
 build_shim() {
     [ -f "$SHIM_SRC" ] || return 1
@@ -72,6 +74,27 @@ patch_runtime_147() {
 
 # Self-heal: rebuild shim if missing.
 [ ! -f "$SHIM_LIB" ] && build_shim
+
+# Self-heal: restore pty.node from permanent backup if missing.
+# `npm install -g @github/copilot` wipes prebuilds/$ANDROID_ARCH/ on every
+# install, including the user-built pty.node. The first install (or `setup.sh`)
+# stashes a copy at $PTY_BACKUP_DIR/pty.node.$ANDROID_ARCH; restore it here so
+# `node-pty` (used by every shell-tool invocation) keeps working after updates.
+PTY_DST="$COPILOT_PKG/prebuilds/$ANDROID_ARCH/pty.node"
+PTY_BACKUP="$PTY_BACKUP_DIR/pty.node.$ANDROID_ARCH"
+if [ ! -f "$PTY_DST" ] && [ -f "$PTY_BACKUP" ]; then
+    mkdir -p "$(dirname "$PTY_DST")"
+    cp -f "$PTY_BACKUP" "$PTY_DST"
+fi
+# Keep the backup mirror in sync if the on-disk pty.node is newer (e.g. user
+# rebuilt it manually after a node-pty version bump).
+if [ -f "$PTY_DST" ] && [ ! -f "$PTY_BACKUP" -o "$PTY_DST" -nt "$PTY_BACKUP" ]; then
+    mkdir -p "$PTY_BACKUP_DIR"
+    cp -f "$PTY_DST" "$PTY_BACKUP"
+fi
+if [ ! -f "$PTY_DST" ]; then
+    echo "[copilot-wrapper] WARN: $PTY_DST missing and no backup at $PTY_BACKUP. Run setup.sh (full install) to rebuild node-pty for $ANDROID_ARCH; shell tools will fail until then." >&2
+fi
 
 # Self-heal: rebuild patched runtime if missing/stale. Detect layout.
 NEW_LAYOUT_DST="$COPILOT_PKG/prebuilds/android-arm64/runtime.node"
