@@ -119,3 +119,13 @@ void __assert_fail(const char *expr, const char *file, unsigned int line, const 
 extern int __cxa_thread_atexit_impl(void (*func)(void *), void *arg, void *dso_handle) __attribute__((weak));
 /* The shim doesn't override if bionic already exports it — weak ref above. */
 
+/* gnu_get_libc_version: glibc-only API returning the runtime glibc version
+ * string (e.g. "2.36"). Added in @github/copilot 1.0.54 — the Rust runtime
+ * binding now probes it, presumably for a glibc-feature gate. We can't lie
+ * with a value high enough to claim *every* feature, so report the version
+ * the binary was actually compiled against (GLIBC_2.17 per the symbol
+ * version tags) — that's the floor it knows it can rely on. */
+const char *gnu_get_libc_version(void) {
+    return "2.17";
+}
+
