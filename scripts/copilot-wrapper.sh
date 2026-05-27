@@ -48,13 +48,15 @@ build_shim() {
     fi
 }
 
-patch_runtime_148() {
-    local src="$COPILOT_PKG/prebuilds/linux-arm64/runtime.node"
-    local dst_dir="$COPILOT_PKG/prebuilds/android-arm64"
-    local dst="$dst_dir/runtime.node"
+patch_glibc_node() {
+    # Shared helper: turn a linux-arm64 glibc .node into an android-arm64-compatible
+    # one. Strips GLIBC symbol versions, drops libgcc_s/libpthread/libdl NEEDED
+    # (their symbols come from libbionic_shim.so or are bundled into bionic libc),
+    # renames libc.so.6→libc.so and libm.so.6→libm.so (bionic SONAMEs).
+    local src="$1" dst="$2"
     [ -f "$src" ] || return 1
     [ -f "$STRIP_PY" ] || return 1
-    mkdir -p "$dst_dir"
+    mkdir -p "$(dirname "$dst")"
     cp -f "$src" "$dst"
     python3 "$STRIP_PY" "$dst" >/dev/null 2>&1 || return 1
     patchelf --remove-needed libgcc_s.so.1 "$dst" 2>/dev/null
@@ -62,6 +64,22 @@ patch_runtime_148() {
     patchelf --remove-needed libdl.so.2 "$dst" 2>/dev/null
     patchelf --replace-needed libc.so.6 libc.so "$dst" 2>/dev/null
     patchelf --replace-needed libm.so.6 libm.so "$dst" 2>/dev/null
+}
+
+patch_runtime_148() {
+    # 1.0.48+ runtime.node — the Rust napi-rs binding for MCP config + session FS.
+    patch_glibc_node \
+        "$COPILOT_PKG/prebuilds/linux-arm64/runtime.node" \
+        "$COPILOT_PKG/prebuilds/android-arm64/runtime.node"
+}
+
+patch_cli_native_154() {
+    # 1.0.54+ cli-native.node — added by upstream alongside the existing runtime
+    # binding. Required for the interactive TUI; if missing on android-arm64,
+    # copilot starts but never paints the screen ("blank black screen").
+    patch_glibc_node \
+        "$COPILOT_PKG/prebuilds/linux-arm64/cli-native.node" \
+        "$COPILOT_PKG/prebuilds/android-arm64/cli-native.node"
 }
 
 patch_runtime_147() {
@@ -106,6 +124,18 @@ if [ -f "$NEW_LAYOUT_SRC" ]; then
     # 1.0.48+ layout
     if [ ! -f "$NEW_LAYOUT_DST" ] || [ "$NEW_LAYOUT_SRC" -nt "$NEW_LAYOUT_DST" ]; then
         patch_runtime_148 || echo "[copilot-wrapper] WARN: failed to patch runtime.node for 1.0.48+ layout" >&2
+    fi
+    # 1.0.54+ adds cli-native.node alongside runtime.node. Required for TUI render
+    # — without it, copilot starts but draws nothing ("blank black screen").
+    CLI_NATIVE_SRC="$COPILOT_PKG/prebuilds/linux-arm64/cli-native.node"
+    CLI_NATIVE_DST="$COPILOT_PKG/prebuilds/android-arm64/cli-native.node"
+    if [ -f "$CLI_NATIVE_SRC" ]; then
+        if [ ! -f "$CLI_NATIVE_DST" ] || [ "$CLI_NATIVE_SRC" -nt "$CLI_NATIVE_DST" ]; then
+            patch_cli_native_154 || echo "[copilot-wrapper] WARN: failed to patch cli-native.node — TUI may render blank" >&2
+        fi
+    elif [ -f "$CLI_NATIVE_DST" ]; then
+        # upstream removed cli-native.node — clean up stale patched copy
+        rm -f "$CLI_NATIVE_DST"
     fi
 elif [ -f "$OLD_LAYOUT_SRC" ]; then
     # 1.0.46–1.0.47 layout
