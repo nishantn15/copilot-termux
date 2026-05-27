@@ -155,6 +155,25 @@ if [ "$UPDATE_MODE" = true ]; then
   PATCH_JS_PY="$SHIM_DIR/patch_js.py"
   LIBUNWIND="/data/data/com.termux/files/usr/lib/libunwind.a"
 
+  # ---- Sync shim sources from repo (so `git pull && ./setup.sh --update` picks
+  #      up new symbol forwarders when upstream copilot adds glibc probes) ----
+  REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  mkdir -p "$SHIM_DIR"
+  for f in bionic_shim.c strip_verneed.py patch_js.py; do
+    if [ -f "$REPO_DIR/shim/$f" ] && { [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; }; then
+      cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
+      echo "✓ Synced $f from repo (your $f was stale or missing)"
+    fi
+  done
+  # Also refresh the wrapper from repo if it has drifted.
+  if [ -f "$REPO_DIR/scripts/copilot-wrapper.sh" ] && \
+     { [ ! -f "$HOME/.local/bin/copilot" ] || ! cmp -s "$REPO_DIR/scripts/copilot-wrapper.sh" "$HOME/.local/bin/copilot"; }; then
+    mkdir -p "$HOME/.local/bin"
+    cp -f "$REPO_DIR/scripts/copilot-wrapper.sh" "$HOME/.local/bin/copilot"
+    chmod +x "$HOME/.local/bin/copilot"
+    echo "✓ Refreshed launcher wrapper from repo"
+  fi
+
   # ---- Build / refresh the shim ----
   if ! command -v clang >/dev/null 2>&1; then
     echo "⚠ clang missing — skipping shim rebuild"
@@ -769,129 +788,120 @@ print_info "Permanent backups at $BACKUP_DIR (survive npm updates)"
 
 print_step "Step 11/13: Installing native runtime patch (1.0.46+ compat)"
 
-# @github/copilot 1.0.46 introduced native/runtime/ (Rust napi-rs binding) with no Android target.
-# We create a bionic compatibility shim and patch the musl binary to work on Android.
-ensure_pkg patchelf patchelf
+# @github/copilot 1.0.46+ ships a Rust napi-rs runtime binding with no Android
+# target. Layout has shifted across versions (1.0.46→1.0.47: native/runtime/
+# with musl variant; 1.0.48+: prebuilds/<plat>/runtime.node, glibc-only;
+# 1.0.54+: adds gnu_get_libc_version probe). The shim sources, ELF surgery
+# tooling, and the launcher wrapper are all version-tracked in this repo —
+# Step 11 syncs the latest copies into ~/.copilot-versions/shim/ and rebuilds.
+# This is the path that `git pull && ./setup.sh` (or --update) relies on to
+# pick up new symbol forwarders when upstream copilot adds glibc probes.
 
+ensure_pkg patchelf patchelf
+ensure_pkg python python
+ensure_pkg ndk-sysroot   # for /data/data/com.termux/files/usr/lib/libunwind.a
+ensure_pkg binutils-is-llvm  # for llvm-objcopy
+python3 -c "import elftools" 2>/dev/null || pip install pyelftools >/dev/null 2>&1
+
+# Detect repo dir from this script's location (handles both `./setup.sh` and
+# `~/copilot-termux-setup/setup.sh` invocations).
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHIM_DIR="$HOME/.copilot-versions/shim"
-SHIM_SRC="$SHIM_DIR/bionic_shim.c"
 SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
-RT_DIR="$INSTALL_ROOT/native/runtime"
-RT_MUSL="$RT_DIR/runtime.linux-arm64-musl.node"
-RT_TARGET="$RT_DIR/runtime.android-arm64.node"
+SHIM_SRC="$SHIM_DIR/bionic_shim.c"
+STRIP_PY="$SHIM_DIR/strip_verneed.py"
+PATCH_JS_PY="$SHIM_DIR/patch_js.py"
+LIBUNWIND="/data/data/com.termux/files/usr/lib/libunwind.a"
 
 mkdir -p "$SHIM_DIR"
 
-# Write bionic shim source if not present
-if [ ! -f "$SHIM_SRC" ]; then
-  cat > "$SHIM_SRC" << 'SHIMEOF'
-#include <string.h>
-#include <stddef.h>
-#include <errno.h>
-
-/* bcmp: deprecated POSIX function. musl libc still uses it; bionic doesn't export it. */
-int bcmp(const void *s1, const void *s2, size_t n) {
-    return memcmp(s1, s2, n);
-}
-
-/* __xpg_strerror_r: glibc/musl's XPG-compliant int-returning strerror_r alias.
- * Bionic only exports the POSIX strerror_r (int return), so forward to it. */
-extern int strerror_r(int, char *, size_t);
-int __xpg_strerror_r(int errnum, char *buf, size_t buflen) {
-    return strerror_r(errnum, buf, buflen);
-}
-
-/* __errno_location: glibc/musl use this name; bionic exports __errno() returning the same. */
-extern int *__errno(void);
-int *__errno_location(void) {
-    return __errno();
-}
-SHIMEOF
-  print_success "Created bionic shim source"
+# Sync shim sources from repo (single source of truth).
+if [ ! -f "$REPO_DIR/shim/bionic_shim.c" ]; then
+  print_error "Repo's shim/bionic_shim.c not found at $REPO_DIR/shim/. Run from a fresh clone of nishantn15/copilot-termux."
+  exit 1
 fi
+SYNCED=0
+for f in bionic_shim.c strip_verneed.py patch_js.py; do
+  if [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; then
+    cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
+    SYNCED=$((SYNCED+1))
+  fi
+done
+[ "$SYNCED" -gt 0 ] && print_success "Synced $SYNCED shim source file(s) from repo → $SHIM_DIR" \
+                   || print_info "Shim sources already up to date"
 
-# Compile shim
+# Build / refresh shim binary. With libunwind.a for _Unwind_* exports.
 if [ ! -f "$SHIM_LIB" ] || [ "$SHIM_SRC" -nt "$SHIM_LIB" ]; then
-  if clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
-      -o "$SHIM_LIB" "$SHIM_SRC"; then
-    print_success "Compiled bionic shim → $SHIM_LIB"
+  if [ -f "$LIBUNWIND" ]; then
+    if clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
+        -Wl,--whole-archive "$LIBUNWIND" -Wl,--no-whole-archive \
+        -o "$SHIM_LIB" "$SHIM_SRC" 2>/dev/null; then
+      for sym in _Unwind_Backtrace _Unwind_DeleteException _Unwind_FindEnclosingFunction \
+                 _Unwind_ForcedUnwind _Unwind_GetCFA _Unwind_GetDataRelBase _Unwind_GetGR \
+                 _Unwind_GetIP _Unwind_GetIPInfo _Unwind_GetLanguageSpecificData \
+                 _Unwind_GetRegionStart _Unwind_GetTextRelBase _Unwind_RaiseException \
+                 _Unwind_Resume _Unwind_Resume_or_Rethrow _Unwind_SetGR _Unwind_SetIP; do
+        llvm-objcopy --globalize-symbol="$sym" --set-symbol-visibility="$sym"=default \
+          "$SHIM_LIB" 2>/dev/null
+      done
+      print_success "Compiled bionic shim (with libunwind _Unwind_*) → $SHIM_LIB"
+    else
+      print_error "Failed to compile bionic shim"
+    fi
   else
-    print_error "Failed to compile bionic shim"
+    clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
+        -o "$SHIM_LIB" "$SHIM_SRC" 2>/dev/null
+    print_warning "Compiled bionic shim WITHOUT libunwind (pkg install ndk-sysroot for _Unwind_* support)"
   fi
 else
-  print_info "Bionic shim already compiled"
+  print_info "Bionic shim already compiled and up to date"
 fi
 
-# Patch native runtime
-if [ -d "$RT_DIR" ] && [ -f "$RT_MUSL" ]; then
-  cp -f "$RT_MUSL" "$RT_TARGET"
-  if patchelf --add-needed libm.so "$RT_TARGET"; then
-    print_success "Patched native runtime → runtime.android-arm64.node"
-  else
+# Detect copilot runtime-binding layout and apply the right patch.
+NEW_SRC="$INSTALL_ROOT/prebuilds/linux-arm64/runtime.node"
+OLD_SRC="$INSTALL_ROOT/native/runtime/runtime.linux-arm64-musl.node"
+
+if [ -f "$NEW_SRC" ]; then
+  # 1.0.48+ layout: glibc binary; strip versions, drop libgcc_s/libpthread/libdl
+  # NEEDED, rename libc/libm SONAMEs to bionic.
+  DST="$INSTALL_ROOT/prebuilds/$ANDROID_ARCH/runtime.node"
+  mkdir -p "$(dirname "$DST")"
+  cp -f "$NEW_SRC" "$DST"
+  python3 "$STRIP_PY" "$DST" >/dev/null
+  patchelf --remove-needed libgcc_s.so.1   "$DST" 2>/dev/null
+  patchelf --remove-needed libpthread.so.0 "$DST" 2>/dev/null
+  patchelf --remove-needed libdl.so.2      "$DST" 2>/dev/null
+  patchelf --replace-needed libc.so.6 libc.so "$DST" 2>/dev/null
+  patchelf --replace-needed libm.so.6 libm.so "$DST" 2>/dev/null
+  print_success "Patched runtime.node ($ANDROID_ARCH, 1.0.48+ layout)"
+
+  # JS allowlist throw — only present 1.0.48+
+  python3 "$PATCH_JS_PY" "$INSTALL_ROOT" >/dev/null && \
+    print_success "Patched index.js + app.js Unsupported-platform throw" || \
+    print_info "JS allowlist patch: nothing to do (already patched or upstream changed shape)"
+elif [ -f "$OLD_SRC" ]; then
+  # 1.0.46–1.0.47 layout
+  DST="$INSTALL_ROOT/native/runtime/runtime.android-arm64.node"
+  cp -f "$OLD_SRC" "$DST"
+  patchelf --add-needed libm.so "$DST" && \
+    print_success "Patched native runtime → runtime.android-arm64.node (1.0.46/47 layout)" || \
     print_error "Failed to patchelf native runtime"
-  fi
 else
-  print_warning "native/runtime/ not found — may not be needed for this version"
+  print_warning "Neither known runtime layout found — may be pre-1.0.46 or a new upstream layout"
 fi
 
 print_step "Step 12/13: Installing copilot wrapper (LD_PRELOAD launcher)"
 
-# The wrapper ensures LD_PRELOAD is set for the bionic shim and self-heals if
-# npm update wipes the patched runtime. Must be in PATH before ~/.npm-global/bin.
+# Wrapper is version-tracked in scripts/copilot-wrapper.sh — copy from repo.
 WRAPPER_DIR="$HOME/.local/bin"
 WRAPPER_PATH="$WRAPPER_DIR/copilot"
 mkdir -p "$WRAPPER_DIR"
 
-cat > "$WRAPPER_PATH" << 'WRAPEOF'
-#!/usr/bin/env bash
-# GitHub Copilot CLI launcher with Termux/bionic compat patches.
-# Background: 1.0.46 introduced @copilot/runtime-native (Rust napi-rs binding) used by
-# MCP config + session FS. Its build matrix has no Android target. Two patches restore it:
-#   1. LD_PRELOAD libbionic_shim.so — shims bcmp/__xpg_strerror_r/__errno_location.
-#   2. native/runtime/runtime.android-arm64.node — a patchelf'd copy of the musl variant
-#      with libm.so added as NEEDED (bionic separates libc/libm; musl bundles them).
-# If npm reinstalls @github/copilot, runtime.android-arm64.node is wiped — this wrapper
-# self-heals on launch.
-
-SHIM_DIR="$HOME/.copilot-versions/shim"
-SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
-COPILOT_PKG="$HOME/.npm-global/lib/node_modules/@github/copilot"
-RT_DIR="$COPILOT_PKG/native/runtime"
-RT_TARGET="$RT_DIR/runtime.android-arm64.node"
-RT_SRC="$RT_DIR/runtime.linux-arm64-musl.node"
-NPM_LOADER="$COPILOT_PKG/npm-loader.js"
-
-# Self-heal: rebuild patched runtime if missing or stale.
-if [ ! -f "$RT_TARGET" ] || [ "$RT_SRC" -nt "$RT_TARGET" ]; then
-    if [ -f "$RT_SRC" ]; then
-        cp -f "$RT_SRC" "$RT_TARGET"
-        patchelf --add-needed libm.so "$RT_TARGET" 2>/dev/null
-    else
-        echo "[copilot-wrapper] runtime musl source missing: $RT_SRC" >&2
-        echo "[copilot-wrapper] You likely have an incompatible copilot version." >&2
-    fi
+if [ ! -f "$REPO_DIR/scripts/copilot-wrapper.sh" ]; then
+  print_error "Repo's scripts/copilot-wrapper.sh not found at $REPO_DIR/scripts/"
+  exit 1
 fi
-
-# Self-heal: rebuild shim if missing.
-if [ ! -f "$SHIM_LIB" ]; then
-    if [ -f "$SHIM_DIR/bionic_shim.c" ] && command -v clang >/dev/null 2>&1; then
-        clang -O2 -shared -fPIC -fvisibility=default -Wl,--no-as-needed -lm \
-            -o "$SHIM_LIB" "$SHIM_DIR/bionic_shim.c" 2>/dev/null
-    fi
-fi
-
-# Compose LD_PRELOAD without nuking caller's value.
-if [ -f "$SHIM_LIB" ]; then
-    if [ -n "${LD_PRELOAD:-}" ]; then
-        export LD_PRELOAD="$SHIM_LIB:$LD_PRELOAD"
-    else
-        export LD_PRELOAD="$SHIM_LIB"
-    fi
-fi
-
-exec /data/data/com.termux/files/usr/bin/node "$NPM_LOADER" "$@"
-WRAPEOF
-
+cp -f "$REPO_DIR/scripts/copilot-wrapper.sh" "$WRAPPER_PATH"
 chmod +x "$WRAPPER_PATH"
 print_success "Installed copilot wrapper → $WRAPPER_PATH"
 
