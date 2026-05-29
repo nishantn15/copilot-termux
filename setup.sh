@@ -73,7 +73,9 @@ if [ "$UPDATE_MODE" = true ]; then
   echo "═══════════════════════════════════════════════════════════"
   echo ""
 
-  OLD_VERSION=$(npm list -g @github/copilot 2>/dev/null | grep copilot | sed 's/.*@//' || echo "unknown")
+  # `command grep` bypasses user shell aliases (e.g. ugrep, ripgrep) that don't
+  # implement GNU grep's option parsing.
+  OLD_VERSION=$(npm list -g @github/copilot 2>/dev/null | command grep copilot | sed 's/.*@//' || echo "unknown")
   echo "ℹ Current version: $OLD_VERSION"
 
   LATEST_VERSION=$(npm view @github/copilot version 2>/dev/null || echo "unknown")
@@ -103,7 +105,7 @@ if [ "$UPDATE_MODE" = true ]; then
   # but Termux reports os:android — --force skips that validation)
   echo ""
   echo "▶ Updating @github/copilot..."
-  if npm update -g @github/copilot --force 2>&1 | grep -v "^npm warn using --force"; then
+  if npm update -g @github/copilot --force 2>&1 | command grep -v "^npm warn using --force"; then
     echo "✓ npm update succeeded"
   else
     echo "✗ npm update failed"
@@ -247,7 +249,11 @@ if [ "$UPDATE_MODE" = true ]; then
   fi
 
   # Step 5: Verify
-  NEW_VERSION=$("$HOME/.local/bin/copilot" --version 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
+  # Anchor on the "CLI <ver>" prefix to avoid catching the node:<pid> warning's
+  # PID. Use `command grep` to bypass any user alias (e.g. ugrep, ripgrep) — both
+  # mangle -oP/-oE differently from GNU grep, which is what we need here.
+  NEW_VERSION=$("$HOME/.local/bin/copilot" --version 2>&1 | command grep -oE 'CLI [0-9]+\.[0-9]+\.[0-9]+' | command grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  [ -z "$NEW_VERSION" ] && NEW_VERSION="unknown"
   echo ""
   echo "═══════════════════════════════════════════════════════════"
   echo "  ✓ Updated: $OLD_VERSION → $NEW_VERSION"
@@ -483,7 +489,7 @@ fi
 
 print_step "Step 5/13: Patching node-addon-api enum handling"
 find node_modules -name "napi.h" | while read -r NAPI_HEADER; do
-    if grep -q "static_cast<napi_typedarray_type>(-1)" "$NAPI_HEADER"; then
+    if command grep -q "static_cast<napi_typedarray_type>(-1)" "$NAPI_HEADER"; then
         cp "$NAPI_HEADER" "$NAPI_HEADER.backup"
         if sed -i 's/static_cast<napi_typedarray_type>(-1)/napi_uint8_array/' "$NAPI_HEADER"; then
             print_success "Patched $NAPI_HEADER"
@@ -906,8 +912,8 @@ chmod +x "$WRAPPER_PATH"
 print_success "Installed copilot wrapper → $WRAPPER_PATH"
 
 # Ensure ~/.local/bin is in PATH (add to .bashrc if not already there)
-if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-  if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+if ! echo "$PATH" | command grep -q "$HOME/.local/bin"; then
+  if ! command grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
     print_info "Added ~/.local/bin to PATH in .bashrc"
   fi
