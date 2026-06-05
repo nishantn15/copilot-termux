@@ -129,3 +129,10 @@ const char *gnu_get_libc_version(void) {
     return "2.17";
 }
 
+
+/* __res_init / res_init: glibc resolver (re)initialization. Added as a probe in
+ * @github/copilot 1.0.60's runtime binding. Bionic has no global _res state and
+ * no res_init — DNS is handled by netd/getaddrinfo. The function historically
+ * returns 0 on success; we no-op since bionic's resolver self-initializes. */
+int __res_init(void) { return 0; }
+int res_init(void) { return 0; }
