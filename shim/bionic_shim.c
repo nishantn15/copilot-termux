@@ -41,10 +41,20 @@ int *__errno_location(void) {
     return __errno();
 }
 
-/* glibc-2.17 stat wrappers. _STAT_VER ignored — bionic struct stat is compatible enough for Rust's libc crate.*/
-int __xstat64(int ver, const char *path, struct stat *buf)             { (void)ver; return stat(path, buf); }
-int __lxstat64(int ver, const char *path, struct stat *buf)            { (void)ver; return lstat(path, buf); }
-int __fxstat64(int ver, int fd, struct stat *buf)                      { (void)ver; return fstat(fd, buf); }
+/* glibc-2.17 stat wrappers. _STAT_VER ignored — bionic struct stat is compatible enough for Rust's libc crate.
+ * Both the *64 (LFS) and non-64 names are provided: glibc routes 32-bit stat
+ * through __xstat etc. and 64-bit through __xstat64. @github/copilot 1.0.61's
+ * runtime began referencing the non-64 __xstat, so both families are shimmed.
+ * On bionic struct stat is always 64-bit-capable, so all forward to the same calls. */
+int __xstat(int ver, const char *path, struct stat *buf)              { (void)ver; return stat(path, buf); }
+int __lxstat(int ver, const char *path, struct stat *buf)             { (void)ver; return lstat(path, buf); }
+int __fxstat(int ver, int fd, struct stat *buf)                       { (void)ver; return fstat(fd, buf); }
+int __fxstatat(int ver, int fd, const char *path, struct stat *buf, int flag) {
+    (void)ver; return fstatat(fd, path, buf, flag);
+}
+int __xstat64(int ver, const char *path, struct stat *buf)            { (void)ver; return stat(path, buf); }
+int __lxstat64(int ver, const char *path, struct stat *buf)           { (void)ver; return lstat(path, buf); }
+int __fxstat64(int ver, int fd, struct stat *buf)                     { (void)ver; return fstat(fd, buf); }
 int __fxstatat64(int ver, int fd, const char *path, struct stat *buf, int flag) {
     (void)ver; return fstatat(fd, path, buf, flag);
 }
@@ -136,3 +146,40 @@ const char *gnu_get_libc_version(void) {
  * returns 0 on success; we no-op since bionic's resolver self-initializes. */
 int __res_init(void) { return 0; }
 int res_init(void) { return 0; }
+
+/* getrandom / gettid / statx: Termux's bionic provides these as inline/syscall
+ * wrappers but does NOT export them as dynamic symbols. @github/copilot 1.0.61
+ * switched its crypto to BoringSSL (OPENSSL_memory_* symbols appeared) whose
+ * RAND + the DNS resolver call getrandom() directly; the binary's WEAK undefined
+ * ref then resolves to NULL and segfaults the resolver thread on first DNS query.
+ * Provide real syscall-backed implementations. */
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <sys/types.h>
+
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+    return syscall(SYS_getrandom, buf, buflen, flags);
+}
+
+pid_t gettid(void) {
+    return (pid_t)syscall(SYS_gettid);
+}
+
+/* statx: glibc/newer-API wrapper; forward to the raw syscall (struct statx is
+ * kernel-ABI, identical across libcs). */
+struct statx;
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *stxbuf) {
+    return syscall(SYS_statx, dirfd, pathname, flags, mask, stxbuf);
+}
+
+/* fcntl64: glibc LFS alias for fcntl. Referenced by @github/copilot 1.0.62's
+ * runtime. Bionic's fcntl is already 64-bit-capable; forward straight to it.
+ * Variadic — grab the optional third arg as void* (covers int and pointer cmds). */
+#include <stdarg.h>
+extern int fcntl(int, int, ...);
+int fcntl64(int fd, int cmd, ...) {
+    va_list ap; va_start(ap, cmd);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    return fcntl(fd, cmd, arg);
+}

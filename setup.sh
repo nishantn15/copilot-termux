@@ -81,9 +81,35 @@ if [ "$UPDATE_MODE" = true ]; then
   LATEST_VERSION=$(npm view @github/copilot version 2>/dev/null || echo "unknown")
   echo "ℹ Latest available: $LATEST_VERSION"
 
+  # Last-known-good ceiling. @github/copilot 1.0.61+ introduced a runtime.node
+  # regression that segfaults on a worker thread during the first network/model
+  # call on Termux/bionic (TUI and --version work, but `-p`/chat crash with
+  # SIGSEGV si_addr=NULL). Root cause is inside the binary's own .text, not a
+  # missing libc symbol — verified 1.0.60 works and 1.0.61/1.0.62-* all crash
+  # with the identical patch toolchain. Until a fix is found (or upstream ships
+  # an android target), cap auto-update at MAX_GOOD_VERSION. Override by setting
+  # COPILOT_ALLOW_BROKEN=1 in the environment to update past it anyway.
+  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION:-1.0.60}"
+
   if [ "$OLD_VERSION" = "$LATEST_VERSION" ]; then
     echo "✓ Already up to date ($OLD_VERSION)"
     exit 0
+  fi
+
+  # version_le A B → true if A <= B (dotted numeric compare via sort -V)
+  version_le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+
+  TARGET_VERSION="$LATEST_VERSION"
+  if [ "${COPILOT_ALLOW_BROKEN:-0}" != "1" ] && ! version_le "$LATEST_VERSION" "$MAX_GOOD_VERSION"; then
+    if version_le "$OLD_VERSION" "$MAX_GOOD_VERSION" && [ "$OLD_VERSION" != "$MAX_GOOD_VERSION" ]; then
+      echo "⚠ Latest ($LATEST_VERSION) is past last-known-good ($MAX_GOOD_VERSION) on Termux."
+      echo "  Pinning to $MAX_GOOD_VERSION instead. Set COPILOT_ALLOW_BROKEN=1 to override."
+      TARGET_VERSION="$MAX_GOOD_VERSION"
+    else
+      echo "✓ Holding at $OLD_VERSION — newer releases ($LATEST_VERSION) regress on Termux."
+      echo "  Set COPILOT_ALLOW_BROKEN=1 ./setup.sh --update to force the upgrade anyway."
+      exit 0
+    fi
   fi
 
   # Step 1: Backup android prebuild
@@ -100,13 +126,14 @@ if [ "$UPDATE_MODE" = true ]; then
     echo "⚠ No pty.node found to backup — will try to build after update"
   fi
 
-  # Step 2: Run npm update
+  # Step 2: Run npm install of the resolved target version (may be the pinned
+  # last-known-good rather than absolute latest — see version guard above).
   # Use --force to bypass platform checks (e.g. @openai/codex requires os:linux
   # but Termux reports os:android — --force skips that validation)
   echo ""
-  echo "▶ Updating @github/copilot..."
-  if npm update -g @github/copilot --force 2>&1 | command grep -v "^npm warn using --force"; then
-    echo "✓ npm update succeeded"
+  echo "▶ Installing @github/copilot@$TARGET_VERSION..."
+  if npm install -g "@github/copilot@$TARGET_VERSION" --force 2>&1 | command grep -v "^npm warn using --force"; then
+    echo "✓ npm install succeeded"
   else
     echo "✗ npm update failed"
     exit 1
