@@ -175,3 +175,47 @@ Once the installation is complete, you can start the GitHub Copilot CLI by runni
 ```bash
 copilot
 ```
+
+## Known ceiling: 1.0.61+ static-TLS regression (unfixable via LD_PRELOAD/patchelf)
+
+`setup.sh --update` pins at **1.0.60**, the last version that runs on Termux/bionic.
+
+**Root cause (diagnosed 2026-06):** copilot's Rust runtime (`runtime.node`) uses
+**TLSDESC** static/initial-exec thread-local storage — confirmed via reloc dump
+(`R_AARCH64_TLSDESC`, zero `__tls_get_addr` calls, zero initial-exec/GOTTPREL).
+bionic's dynamic linker reserves only a small fixed **static-TLS surplus** for
+`dlopen`'d modules, allocated per-thread at `pthread_create`. The binary's static
+TLS block grew across releases:
+
+| version | PT_TLS memsz | TLSDESC relocs | result |
+|---------|--------------|----------------|--------|
+| 1.0.60  | 0x2e8 (744 B) | 25 | works |
+| 1.0.61  | (grew)       | +  | crashes |
+| 1.0.63  | 0x370 (880 B) | 32 | crashes |
+
+Once the module's per-thread static-TLS demand exceeds bionic's surplus, **worker
+threads** (the BoringSSL/zstd/tokio pool that handles the first HTTPS/model call)
+get an unbacked TLS slot → a TLSDESC-resolved pointer reads NULL → `SIGSEGV
+si_addr=NULL` on a `pthread_create`'d thread. The **main thread works** (its TLS
+is set up differently), which is why `--version` and TUI startup succeed but
+`-p`/chat crash.
+
+**Why the shim/patchelf approach can't fix it:** TP (thread pointer) layout and
+the static-TLS surplus are architectural invariants owned by bionic's linker.
+No `LD_PRELOAD` symbol or `patchelf` edit can enlarge the per-thread static-TLS
+arena for a `dlopen`'d glibc module. Ruled out as non-causal (via logging-stub
+interposers): `__tls_get_addr` (never called), `_Unwind_*` (never called),
+`getrandom`/`getauxval`/`pthread_key_create` (all work), `dlopen` (all succeed),
+IFUNC (zero), DT_NULL-mid-`.dynamic` (fixed anyway).
+
+**Options to go past 1.0.60:**
+1. **Stay on 1.0.60** (current default) — fully working.
+2. **proot-distro glibc** — run the *unmodified* linux-arm64 binary under a real
+   glibc rootfs (`pkg install proot-distro && proot-distro install debian`).
+   Sidesteps the bionic TLS limit entirely (glibc grows static TLS dynamically).
+   Cost: ~1–2 GB, slower syscalls, DNS via `/etc/resolv.conf` not Android netd.
+3. **Wait for upstream** to ship an `aarch64-linux-android` build (would use
+   bionic's TLS model natively) — worth filing at github/copilot-cli.
+
+`COPILOT_ALLOW_BROKEN=1 ./setup.sh --update` forces past the pin if you want to
+test a future release that may have shrunk its TLS footprint.
