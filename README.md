@@ -176,46 +176,160 @@ Once the installation is complete, you can start the GitHub Copilot CLI by runni
 copilot
 ```
 
-## Known ceiling: 1.0.61+ static-TLS regression (unfixable via LD_PRELOAD/patchelf)
+## SOLVED: the 1.0.61+ segfault (fixed 2026-07-30, ceiling lifted)
 
-`setup.sh --update` pins at **1.0.60**, the last version that runs on Termux/bionic.
+Versions **1.0.61 through 1.0.75** segfaulted on Termux/bionic shortly after
+startup: `--version` and the TUI worked, but `-p`/chat died with SIGSEGV. This
+repo pinned to 1.0.60 for weeks as a result. **That pin is now removed — 1.0.76
+works end to end** (prompts, shell tools, MCP, session resume, interactive TUI).
 
-**Root cause (diagnosed 2026-06):** copilot's Rust runtime (`runtime.node`) uses
-**TLSDESC** static/initial-exec thread-local storage — confirmed via reloc dump
-(`R_AARCH64_TLSDESC`, zero `__tls_get_addr` calls, zero initial-exec/GOTTPREL).
-bionic's dynamic linker reserves only a small fixed **static-TLS surplus** for
-`dlopen`'d modules, allocated per-thread at `pthread_create`. The binary's static
-TLS block grew across releases:
+### Root cause: `pthread_mutexattr_t` is twice as wide on bionic
 
-| version | PT_TLS memsz | TLSDESC relocs | result |
-|---------|--------------|----------------|--------|
-| 1.0.60  | 0x2e8 (744 B) | 25 | works |
-| 1.0.61  | (grew)       | +  | crashes |
-| 1.0.63  | 0x370 (880 B) | 32 | crashes |
+```
+musl   pthread_mutexattr_t = unsigned  (4 bytes)
+bionic pthread_mutexattr_t = long      (8 bytes)   # bits/pthread_types.h
+```
 
-Once the module's per-thread static-TLS demand exceeds bionic's surplus, **worker
-threads** (the BoringSSL/zstd/tokio pool that handles the first HTTPS/model call)
-get an unbacked TLS slot → a TLSDESC-resolved pointer reads NULL → `SIGSEGV
-si_addr=NULL` on a `pthread_create`'d thread. The **main thread works** (its TLS
-is set up differently), which is why `--version` and TUI startup succeed but
-`-p`/chat crash.
+`runtime.node` is musl-built, so it reserves only **4 bytes** for the attr. In
+the faulting singleton-init the attr lives on the stack at `sp+0xc`, immediately
+below the callee-saved spill written by `stp x20, x19, [sp, #0x10]`. bionic then
+writes **8** bytes through that pointer:
 
-**Why the shim/patchelf approach can't fix it:** TP (thread pointer) layout and
-the static-TLS surplus are architectural invariants owned by bionic's linker.
-No `LD_PRELOAD` symbol or `patchelf` edit can enlarge the per-thread static-TLS
-arena for a `dlopen`'d glibc module. Ruled out as non-causal (via logging-stub
-interposers): `__tls_get_addr` (never called), `_Unwind_*` (never called),
-`getrandom`/`getauxval`/`pthread_key_create` (all work), `dlopen` (all succeed),
-IFUNC (zero), DT_NULL-mid-`.dynamic` (fixed anyway).
+- `pthread_mutexattr_init()` zeroes 8 bytes
+- `pthread_mutexattr_destroy()` writes 8× `0xFF`
 
-**Options to go past 1.0.60:**
-1. **Stay on 1.0.60** (current default) — fully working.
-2. **proot-distro glibc** — run the *unmodified* linux-arm64 binary under a real
-   glibc rootfs (`pkg install proot-distro && proot-distro install debian`).
-   Sidesteps the bionic TLS limit entirely (glibc grows static TLS dynamically).
-   Cost: ~1–2 GB, slower syscalls, DNS via `/etc/resolv.conf` not Android netd.
-3. **Wait for upstream** to ship an `aarch64-linux-android` build (would use
-   bionic's TLS model natively) — worth filing at github/copilot-cli.
+The upper 4 bytes land on the saved `x19`/`x20`, so a callee-saved register
+returns as `0x..ffffffff`. Which register gets hit depends on the caller's frame
+layout, which is why the crash looked nondeterministic under ptrace.
 
-`COPILOT_ALLOW_BROKEN=1 ./setup.sh --update` forces past the pin if you want to
-test a future release that may have shrunk its TLS footprint.
+### The fix: scoped `.dynstr` import renaming
+
+`LD_PRELOAD` cannot fix this. Termux's `node` executable itself *exports*
+`getaddrinfo`, and on bionic the main executable wins symbol resolution over both
+`LD_PRELOAD` and a `dlopen`'d module's own `DT_NEEDED` libc — which is why every
+earlier interpose silently never fired.
+
+Instead, rename the module's `UND` import names **in place** in `.dynstr` to a
+same-length capitalised spelling (`getaddrinfo` → `Getaddrinfo`), then
+`patchelf --add-needed` a small translator `.so` ordered *before* `libc.so` with
+`--set-rpath '$ORIGIN'`. Only that module's calls are redirected; node's own
+libuv/c-ares keep calling bionic directly. Same-length renaming means no offsets
+shift, so the 115 MB binary needs no relinking.
+
+Two translators, both in `shim/`:
+
+| translator | renames | what it fixes |
+|---|---|---|
+| `pthread_xlate.c` | `pthread_mutexattr_init`/`settype`/`destroy`, `pthread_mutex_init` | Keeps a real 8-byte bionic attr in a local; writes back **only the low 4 bytes** to the musl-sized slot. This is the 1.0.61+ fix. |
+| `gai_xlate.c` | `getaddrinfo`, `freeaddrinfo` | musl and bionic **swap** `ai_addr` and `ai_canonname` in `struct addrinfo` (0x30 both). A musl consumer reads bionic's NULL `ai_canonname` as `ai_addr` and derefs `sa_family`. Deep-copies the list into musl order. |
+
+`shim/rename_imports.py` performs the rename (pyelftools). It has a `--check`
+mode and refuses to double-apply, so the wrapper can re-run it safely after any
+`npm install`.
+
+### Verification (clean A/B on 1.0.76)
+
+Same binary, same `LD_PRELOAD` shim, same prompt:
+
+| build | result |
+|---|---|
+| unpatched | SIGSEGV, exit 139, no output |
+| `gai` translator only | SIGSEGV, exit 139 |
+| `gai` + `pthread` translators | **exit 0**, prompt answered, credits billed |
+
+The middle row is the important one: it isolates the mutexattr fix as the thing
+that actually lifts the ceiling.
+
+### Guard-page proof that the translator never writes a 5th byte
+
+`shim/guard.c` places the 4-byte musl attr in the **last 4 bytes of a writable
+page** with a `PROT_NONE` page immediately after, so any 5th byte written faults:
+
+| call path | result |
+|---|---|
+| raw bionic `pthread_mutexattr_init` on that slot | **SIGSEGV** (exit 139) - bionic really does store 8 bytes |
+| `libpthread_xlate.so` init/settype/mutex_init/destroy on that slot | no fault; slot ends `ffffffff`, guard page untouched |
+
+The same probe also confirms semantics survive translation: an attr built through
+the shim with `PTHREAD_MUTEX_RECURSIVE` produces a mutex that can be locked
+twice, and a deliberately 4-mod-8 misaligned slot mid-page also survives.
+
+### Wrapper-coverage audit
+
+Every attr-touching import is renamed, and nothing bypasses the translator.
+`runtime.node` 1.0.76 imports 30 `pthread_*` symbols; the only ones taking a
+libc-owned *attribute* object are the four we intercept:
+
+```
+Pthread_mutexattr_init  Pthread_mutexattr_settype
+Pthread_mutexattr_destroy  Pthread_mutex_init      <- renamed, ours
+```
+
+There are **no** imports of `pthread_condattr_*`, `pthread_spin_*`, `sem_*`, or
+`pthread_mutexattr_get*/setpshared/setprotocol`, so the two latent 8-vs-4 types
+below are genuinely unreachable today. `pthread_attr_t`, `pthread_rwlock_t`,
+`pthread_once_t` and `pthread_key_t` are all equal-or-larger on bionic and are
+created and consumed entirely by bionic, so they are safe (their internal
+encodings differ, but no object ever crosses libcs).
+
+### Related ABI widths worth watching
+
+Bionic is **wider** than musl for three types on aarch64 LP64. Only the first is
+currently imported by `runtime.node`, but re-audit if a future release adds
+pthread calls:
+
+| type | bionic | musl | status |
+|---|---|---|---|
+| `pthread_mutexattr_t` | 8 | 4 | **was the bug** |
+| `pthread_condattr_t` | 8 | 4 | latent, not imported |
+| `pthread_spinlock_t` | 8 | 4 | latent, not imported |
+
+`pthread_mutex_t` (40), `pthread_cond_t` (48), `pthread_rwlock_t` (56),
+`pthread_attr_t` (56), `pthread_barrier_t` (32), `pthread_once_t` (4) and
+`pthread_key_t` (4) all match, so only the attr pointer needed widening.
+
+### Previously-published theory, now disproven
+
+Earlier revisions of this README blamed bionic's **static-TLS surplus** being
+exhausted by the module's growing `PT_TLS` block, and concluded the crash was
+"unfixable via LD_PRELOAD/patchelf" short of a proot glibc rootfs. That was
+wrong. The decisive experiment: `LD_PRELOAD` the runtime *itself*, which makes it
+an initial static-TLS module (preloads load before
+`linker_finalize_static_tls()`). The crash was **identical**, same PC. bionic
+does support `R_AARCH64_TLSDESC` for `dlopen`'d modules, and the faulting
+`mov w0,#1; ldur x8,[x20,#0x6c]; blr x8` is ABI-incompatible with TLSDESC anyway
+(TLSDESC passes the descriptor address in `x0`). No proot needed.
+
+### Version pinning
+
+The ceiling is lifted. To re-pin if a future release regresses:
+
+```bash
+COPILOT_MAX_VERSION=1.0.76 ./setup.sh --update
+```
+
+### 1.0.73+ needs two packages
+
+From 1.0.73 upstream split the package: `@github/copilot` is a ~5 KB loader stub
+and the real binaries ship in per-platform optional deps.
+
+```bash
+npm install -g @github/copilot
+npm install -g --force @github/copilot-linuxmusl-arm64
+```
+
+The `--force` is required: the platform package declares `os: ["linux"]` and
+Termux reports `"android"`, so npm silently skips it as an optional dependency.
+
+Two loader quirks the wrapper handles for you:
+
+1. The stub's `npm-loader.js` gates on `process.platform === "linux"` and would
+   spawn the musl **SEA** binary (interpreter `/lib/ld-musl-aarch64.so.1`, absent
+   on bionic). The wrapper bypasses the stub and runs the platform package's
+   `index.js` under Termux node.
+2. `detect-libc` reports "glibc" on bionic, so the loader looks in
+   `prebuilds/linux-arm64`; the wrapper symlinks that to `linuxmusl-arm64`.
+
+Good news: 1.0.76 no longer throws `Unsupported platform`, because `os.type()`
+returns `"Linux"` on Termux even though `process.platform` is `"android"` — so
+`patch_js.py` is no longer needed.

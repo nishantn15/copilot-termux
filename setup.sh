@@ -81,15 +81,31 @@ if [ "$UPDATE_MODE" = true ]; then
   LATEST_VERSION=$(npm view @github/copilot version 2>/dev/null || echo "unknown")
   echo "ℹ Latest available: $LATEST_VERSION"
 
-  # Last-known-good ceiling. @github/copilot 1.0.61+ introduced a runtime.node
-  # regression that segfaults on a worker thread during the first network/model
-  # call on Termux/bionic (TUI and --version work, but `-p`/chat crash with
-  # SIGSEGV si_addr=NULL). Root cause is inside the binary's own .text, not a
-  # missing libc symbol — verified 1.0.60 works and 1.0.61/1.0.62-* all crash
-  # with the identical patch toolchain. Until a fix is found (or upstream ships
-  # an android target), cap auto-update at MAX_GOOD_VERSION. Override by setting
-  # COPILOT_ALLOW_BROKEN=1 in the environment to update past it anyway.
-  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION:-1.0.60}"
+  # Last-known-good ceiling.
+  #
+  # HISTORY: 1.0.61 through 1.0.75 segfaulted on Termux after startup, so this
+  # was pinned to 1.0.60 for weeks. Root cause found 2026-07-30 and it was a
+  # plain libc ABI width mismatch, not anything inside the binary's own logic:
+  #
+  #     musl   pthread_mutexattr_t = unsigned  (4 bytes)
+  #     bionic pthread_mutexattr_t = long      (8 bytes)
+  #
+  # The musl-built runtime.node reserves only 4 bytes for the attr, and in the
+  # faulting singleton-init it lives on the stack directly below the callee-saved
+  # spill from `stp x20, x19, [sp, #0x10]`. bionic's pthread_mutexattr_init
+  # zeroes 8 bytes and pthread_mutexattr_destroy writes 8x 0xFF, so the upper 4
+  # bytes overwrite the saved x19/x20 and the register returns as 0x..ffffffff.
+  #
+  # Fixed by shim/pthread_xlate.c, scoped to runtime.node via an in-place
+  # .dynstr import rename + patchelf --add-needed (see the wrapper header).
+  # 1.0.76 verified working end to end: prompts, shell tools, MCP, resume, TUI.
+  #
+  # The ceiling is therefore lifted (empty = no cap). Set COPILOT_MAX_VERSION to
+  # re-pin if a future release regresses.
+  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION:-}"
+  if [ -z "$MAX_GOOD_VERSION" ]; then
+    MAX_GOOD_VERSION="$LATEST_VERSION"
+  fi
 
   if [ "$OLD_VERSION" = "$LATEST_VERSION" ]; then
     echo "✓ Already up to date ($OLD_VERSION)"

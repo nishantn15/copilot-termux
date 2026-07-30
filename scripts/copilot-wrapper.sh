@@ -1,31 +1,98 @@
 #!/usr/bin/env bash
 # GitHub Copilot CLI launcher with Termux/bionic compat patches.
-# Self-heals after `npm update` wipes the prebuilds dir.
+# Self-heals after `npm install -g` replaces the platform package.
 #
-# Layout history:
-#   1.0.45 — no native runtime, pure JS, no patch needed
-#   1.0.46–1.0.47 — native/runtime/runtime.<plat>-<libc>.node (musl variant shipped)
-#   1.0.48+ — prebuilds/<plat>/runtime.node (glibc-only, plus icu-native.node)
+# ============================================================================
+# 1.0.61+ ROOT CAUSE (solved 2026-07-30) - pthread_mutexattr_t width mismatch
+# ============================================================================
+# Every version from 1.0.61 to 1.0.75 segfaulted on Termux after startup. The
+# cause was NOT bionic's static-TLS surplus (an earlier theory, now disproven).
+# It is a plain ABI width mismatch:
 #
-# Patches applied:
-#   1. LD_PRELOAD libbionic_shim.so — shims bcmp/__xpg_strerror_r/__errno_location/
-#      __xstat64-family/__assert_fail/__ctype_b_loc + statically-linked _Unwind_*.
-#   2. prebuilds/android-arm64/runtime.node — derived from prebuilds/linux-arm64/
-#      runtime.node by: strip GLIBC symbol versions, drop libgcc_s/libpthread/libdl
-#      NEEDED, rename libc.so.6→libc.so, libm.so.6→libm.so.
-#   3. (1.0.46–1.0.47 only) native/runtime/runtime.android-arm64.node — patchelf
-#      copy of the musl variant with libm.so added to NEEDED.
+#     musl   pthread_mutexattr_t = unsigned  (4 bytes)
+#     bionic pthread_mutexattr_t = long      (8 bytes)
+#
+# runtime.node is musl-built, so it reserves only 4 bytes for the attr. In the
+# faulting singleton-init the attr lives on the stack directly BELOW the
+# callee-saved spill slot written by `stp x20, x19, [sp, #0x10]`. bionic then
+# writes 8 bytes through that pointer - pthread_mutexattr_init() zeroes 8, and
+# pthread_mutexattr_destroy() writes 8x 0xFF - so the upper 4 bytes land on the
+# saved x19/x20 and the register returns as 0x..ffffffff. Which register gets
+# hit depends on the caller's frame layout, which is why it looked random.
+#
+# Fix: libpthread_xlate.so keeps a real 8-byte bionic attr in a local and only
+# ever writes the low 4 bytes back to the musl-sized slot.
+#
+# Verified A/B on 1.0.76 (same binary, same shim, same prompt):
+#   unpatched                -> SIGSEGV (exit 139), no output
+#   gai translator only      -> SIGSEGV (exit 139)
+#   gai + pthread translator -> exit 0, prompt answered, credits billed
+#
+# ============================================================================
+# Layout history
+# ============================================================================
+#   1.0.45          - no native runtime, pure JS, no patch needed
+#   1.0.46-1.0.47   - native/runtime/runtime.<plat>-<libc>.node (musl shipped)
+#   1.0.48-1.0.72   - prebuilds/<plat>/runtime.node, glibc-only
+#   1.0.73+         - SPLIT PACKAGE: @github/copilot is a tiny loader stub;
+#                     real binaries live in per-platform optional deps
+#                     @github/copilot-linuxmusl-arm64 (musl) and
+#                     @github/copilot-linux-arm64 (glibc). We use the MUSL one.
+#
+# On 1.0.73+ npm SKIPS the platform package (its os field is "linux", we are
+# "android"), so setup installs it explicitly with --force. The stub's
+# npm-loader.js also gates on process.platform === "linux" and would spawn the
+# musl SEA binary (needs /lib/ld-musl-aarch64.so.1, absent on bionic), so we
+# bypass the stub entirely and run the platform package's index.js under
+# Termux node.
+#
+# ============================================================================
+# Patches applied to the musl runtime.node
+# ============================================================================
+#   1. LD_PRELOAD libbionic_shim.so - bcmp, __xpg_strerror_r,
+#      __errno_location, __xstat64-family, __ctype_b_loc, __assert_fail,
+#      gnu_get_libc_version, __res_init, getrandom/gettid/statx, fcntl64,
+#      plus statically-linked _Unwind_*.
+#   2. .dynstr in-place import renames (same length, so no offsets shift) that
+#      scope six libc calls to translator shims add-needed BEFORE libc.so:
+#        getaddrinfo/freeaddrinfo -> libgai_xlate.so
+#          (musl vs bionic swap ai_addr and ai_canonname in struct addrinfo;
+#           also Termux's node itself exports getaddrinfo and wins bionic
+#           symbol resolution, which is why LD_PRELOAD alone never worked)
+#        pthread_mutexattr_init/settype/destroy + pthread_mutex_init
+#          -> libpthread_xlate.so   (the 8-vs-4-byte fix described above)
+#      Scoping via DT_NEEDED (not LD_PRELOAD) means node's own libuv/c-ares
+#      keep calling bionic directly, untouched.
+#   3. patchelf --add-needed libm.so libdl.so, --set-rpath '$ORIGIN'.
+#   4. prebuilds/linux-arm64 -> linuxmusl-arm64 symlink, because detect-libc
+#      reports "glibc" on bionic so the loader looks in the linux-arm64 dir.
 
 SHIM_DIR="$HOME/.copilot-versions/shim"
 SHIM_LIB="$SHIM_DIR/libbionic_shim.so"
 SHIM_SRC="$SHIM_DIR/bionic_shim.c"
+GAI_LIB="$SHIM_DIR/libgai_xlate.so"
+GAI_SRC="$SHIM_DIR/gai_xlate.c"
+PTH_LIB="$SHIM_DIR/libpthread_xlate.so"
+PTH_SRC="$SHIM_DIR/pthread_xlate.c"
+RENAME_PY="$SHIM_DIR/rename_imports.py"
 STRIP_PY="$SHIM_DIR/strip_verneed.py"
 PATCH_JS_PY="$SHIM_DIR/patch_js.py"
-COPILOT_PKG="$HOME/.npm-global/lib/node_modules/@github/copilot"
-NPM_LOADER="$COPILOT_PKG/npm-loader.js"
+
+NODE_MODULES="$HOME/.npm-global/lib/node_modules"
+STUB_PKG="$NODE_MODULES/@github/copilot"
+ARCH_SUFFIX="arm64"
+MUSL_PKG="$NODE_MODULES/@github/copilot-linuxmusl-$ARCH_SUFFIX"
+LEGACY_PKG="$STUB_PKG"
+
 LIBUNWIND="/data/data/com.termux/files/usr/lib/libunwind.a"
 PTY_BACKUP_DIR="$HOME/.copilot-termux-backups"
-ANDROID_ARCH="android-arm64"  # TODO: detect from uname -m for non-arm64 hosts
+ANDROID_ARCH="android-arm64"
+
+# Symbols whose .dynstr names get capitalised so they bind to our translators.
+GAI_SYMS="getaddrinfo freeaddrinfo"
+PTH_SYMS="pthread_mutexattr_init pthread_mutexattr_settype pthread_mutexattr_destroy pthread_mutex_init"
+
+warn() { echo "[copilot-wrapper] $*" >&2; }
 
 build_shim() {
     [ -f "$SHIM_SRC" ] || return 1
@@ -48,11 +115,55 @@ build_shim() {
     fi
 }
 
+build_translator() {
+    # $1 = output .so, $2 = source .c
+    [ -f "$2" ] || return 1
+    command -v clang >/dev/null 2>&1 || return 1
+    clang -O2 -shared -fPIC -fvisibility=default -ldl -o "$1" "$2" 2>/dev/null
+}
+
+# --- 1.0.73+ split-package path -------------------------------------------
+
+patch_musl_runtime() {
+    # Idempotent. rename_imports.py refuses to double-apply (it verifies the
+    # exact expected bytes), and patchelf --add-needed is a no-op if present.
+    local dir="$MUSL_PKG/prebuilds/linuxmusl-$ARCH_SUFFIX"
+    local rt="$dir/runtime.node"
+    [ -f "$rt" ] || return 1
+    [ -f "$RENAME_PY" ] || { warn "missing $RENAME_PY"; return 1; }
+
+    cp -f "$GAI_LIB" "$PTH_LIB" "$dir/" 2>/dev/null
+
+    # Already patched? Then the renamed symbols are present and originals gone.
+    if python3 "$RENAME_PY" --check "$rt" $GAI_SYMS $PTH_SYMS >/dev/null 2>&1; then
+        # Originals still present -> needs renaming.
+        python3 "$RENAME_PY" "$rt" $GAI_SYMS $PTH_SYMS >/dev/null 2>&1 || {
+            warn "ERROR: .dynstr rename failed on $rt. Copilot will segfault."
+            warn "       Upstream may have changed the import set; run:"
+            warn "       python3 $RENAME_PY --check $rt $GAI_SYMS $PTH_SYMS"
+            return 1
+        }
+    fi
+
+    for lib in libm.so libdl.so libgai_xlate.so libpthread_xlate.so; do
+        patchelf --add-needed "$lib" "$rt" 2>/dev/null
+    done
+    patchelf --set-rpath '$ORIGIN' "$rt" 2>/dev/null
+
+    # detect-libc says "glibc" on bionic, so the loader looks in linux-arm64.
+    ln -sfn "linuxmusl-$ARCH_SUFFIX" "$MUSL_PKG/prebuilds/linux-$ARCH_SUFFIX" 2>/dev/null
+    return 0
+}
+
+runtime_is_patched() {
+    local rt="$MUSL_PKG/prebuilds/linuxmusl-$ARCH_SUFFIX/runtime.node"
+    [ -f "$rt" ] || return 1
+    readelf -d "$rt" 2>/dev/null | command grep -q 'libpthread_xlate\.so'
+}
+
+# --- legacy (<=1.0.72) single-package path ---------------------------------
+
 patch_glibc_node() {
-    # Shared helper: turn a linux-arm64 glibc .node into an android-arm64-compatible
-    # one. Strips GLIBC symbol versions, drops libgcc_s/libpthread/libdl NEEDED
-    # (their symbols come from libbionic_shim.so or are bundled into bionic libc),
-    # renames libc.so.6→libc.so and libm.so.6→libm.so (bionic SONAMEs).
     local src="$1" dst="$2"
     [ -f "$src" ] || return 1
     [ -f "$STRIP_PY" ] || return 1
@@ -66,120 +177,95 @@ patch_glibc_node() {
     patchelf --replace-needed libm.so.6 libm.so "$dst" 2>/dev/null
 }
 
-patch_runtime_148() {
-    # 1.0.48+ runtime.node — the Rust napi-rs binding for MCP config + session FS.
-    patch_glibc_node \
-        "$COPILOT_PKG/prebuilds/linux-arm64/runtime.node" \
-        "$COPILOT_PKG/prebuilds/android-arm64/runtime.node"
-}
+legacy_selfheal() {
+    local NEW_DST="$LEGACY_PKG/prebuilds/android-arm64/runtime.node"
+    local NEW_SRC="$LEGACY_PKG/prebuilds/linux-arm64/runtime.node"
+    local OLD_DST="$LEGACY_PKG/native/runtime/runtime.android-arm64.node"
+    local OLD_SRC="$LEGACY_PKG/native/runtime/runtime.linux-arm64-musl.node"
 
-patch_cli_native_154() {
-    # 1.0.54+ cli-native.node — added by upstream alongside the existing runtime
-    # binding. Required for the interactive TUI; if missing on android-arm64,
-    # copilot starts but never paints the screen ("blank black screen").
-    patch_glibc_node \
-        "$COPILOT_PKG/prebuilds/linux-arm64/cli-native.node" \
-        "$COPILOT_PKG/prebuilds/android-arm64/cli-native.node"
-}
-
-patch_runtime_147() {
-    local src="$COPILOT_PKG/native/runtime/runtime.linux-arm64-musl.node"
-    local dst="$COPILOT_PKG/native/runtime/runtime.android-arm64.node"
-    [ -f "$src" ] || return 1
-    cp -f "$src" "$dst"
-    patchelf --add-needed libm.so "$dst" 2>/dev/null
-}
-
-# Self-heal: rebuild shim if missing.
-[ ! -f "$SHIM_LIB" ] && build_shim
-
-# Self-heal: restore pty.node from permanent backup if missing.
-# `npm install -g @github/copilot` wipes prebuilds/$ANDROID_ARCH/ on every
-# install, including the user-built pty.node. The first install (or `setup.sh`)
-# stashes a copy at $PTY_BACKUP_DIR/pty.node.$ANDROID_ARCH; restore it here so
-# `node-pty` (used by every shell-tool invocation) keeps working after updates.
-PTY_DST="$COPILOT_PKG/prebuilds/$ANDROID_ARCH/pty.node"
-PTY_BACKUP="$PTY_BACKUP_DIR/pty.node.$ANDROID_ARCH"
-if [ ! -f "$PTY_DST" ] && [ -f "$PTY_BACKUP" ]; then
-    mkdir -p "$(dirname "$PTY_DST")"
-    cp -f "$PTY_BACKUP" "$PTY_DST"
-fi
-# Keep the backup mirror in sync if the on-disk pty.node is newer (e.g. user
-# rebuilt it manually after a node-pty version bump).
-if [ -f "$PTY_DST" ] && [ ! -f "$PTY_BACKUP" -o "$PTY_DST" -nt "$PTY_BACKUP" ]; then
-    mkdir -p "$PTY_BACKUP_DIR"
-    cp -f "$PTY_DST" "$PTY_BACKUP"
-fi
-if [ ! -f "$PTY_DST" ]; then
-    echo "[copilot-wrapper] WARN: $PTY_DST missing and no backup at $PTY_BACKUP. Run setup.sh (full install) to rebuild node-pty for $ANDROID_ARCH; shell tools will fail until then." >&2
-fi
-
-# Self-heal: rebuild patched runtime if missing/stale. Detect layout.
-NEW_LAYOUT_DST="$COPILOT_PKG/prebuilds/android-arm64/runtime.node"
-NEW_LAYOUT_SRC="$COPILOT_PKG/prebuilds/linux-arm64/runtime.node"
-OLD_LAYOUT_DST="$COPILOT_PKG/native/runtime/runtime.android-arm64.node"
-OLD_LAYOUT_SRC="$COPILOT_PKG/native/runtime/runtime.linux-arm64-musl.node"
-
-if [ -f "$NEW_LAYOUT_SRC" ]; then
-    # 1.0.48+ layout
-    if [ ! -f "$NEW_LAYOUT_DST" ] || [ "$NEW_LAYOUT_SRC" -nt "$NEW_LAYOUT_DST" ]; then
-        patch_runtime_148 || echo "[copilot-wrapper] WARN: failed to patch runtime.node for 1.0.48+ layout" >&2
+    local PTY_DST="$LEGACY_PKG/prebuilds/$ANDROID_ARCH/pty.node"
+    local PTY_BACKUP="$PTY_BACKUP_DIR/pty.node.$ANDROID_ARCH"
+    if [ ! -f "$PTY_DST" ] && [ -f "$PTY_BACKUP" ]; then
+        mkdir -p "$(dirname "$PTY_DST")"; cp -f "$PTY_BACKUP" "$PTY_DST"
     fi
-    # 1.0.54+ adds cli-native.node alongside runtime.node. Required for TUI render
-    # — without it, copilot starts but draws nothing ("blank black screen").
-    CLI_NATIVE_SRC="$COPILOT_PKG/prebuilds/linux-arm64/cli-native.node"
-    CLI_NATIVE_DST="$COPILOT_PKG/prebuilds/android-arm64/cli-native.node"
-    if [ -f "$CLI_NATIVE_SRC" ]; then
-        if [ ! -f "$CLI_NATIVE_DST" ] || [ "$CLI_NATIVE_SRC" -nt "$CLI_NATIVE_DST" ]; then
-            patch_cli_native_154 || echo "[copilot-wrapper] WARN: failed to patch cli-native.node — TUI may render blank" >&2
+    if [ -f "$PTY_DST" ] && { [ ! -f "$PTY_BACKUP" ] || [ "$PTY_DST" -nt "$PTY_BACKUP" ]; }; then
+        mkdir -p "$PTY_BACKUP_DIR"; cp -f "$PTY_DST" "$PTY_BACKUP"
+    fi
+
+    if [ -f "$NEW_SRC" ]; then
+        if [ ! -f "$NEW_DST" ] || [ "$NEW_SRC" -nt "$NEW_DST" ]; then
+            patch_glibc_node "$NEW_SRC" "$NEW_DST" || warn "WARN: failed to patch runtime.node (1.0.48+ layout)"
         fi
-    elif [ -f "$CLI_NATIVE_DST" ]; then
-        # upstream removed cli-native.node — clean up stale patched copy
-        rm -f "$CLI_NATIVE_DST"
+        local CN_SRC="$LEGACY_PKG/prebuilds/linux-arm64/cli-native.node"
+        local CN_DST="$LEGACY_PKG/prebuilds/android-arm64/cli-native.node"
+        if [ -f "$CN_SRC" ]; then
+            if [ ! -f "$CN_DST" ] || [ "$CN_SRC" -nt "$CN_DST" ]; then
+                patch_glibc_node "$CN_SRC" "$CN_DST" || warn "WARN: failed to patch cli-native.node - TUI may render blank"
+            fi
+        elif [ -f "$CN_DST" ]; then
+            rm -f "$CN_DST"
+        fi
+    elif [ -f "$OLD_SRC" ]; then
+        if [ ! -f "$OLD_DST" ] || [ "$OLD_SRC" -nt "$OLD_DST" ]; then
+            cp -f "$OLD_SRC" "$OLD_DST" && patchelf --add-needed libm.so "$OLD_DST" 2>/dev/null
+        fi
     fi
-elif [ -f "$OLD_LAYOUT_SRC" ]; then
-    # 1.0.46–1.0.47 layout
-    if [ ! -f "$OLD_LAYOUT_DST" ] || [ "$OLD_LAYOUT_SRC" -nt "$OLD_LAYOUT_DST" ]; then
-        patch_runtime_147 || echo "[copilot-wrapper] WARN: failed to patch runtime.node for 1.0.46/47 layout" >&2
+
+    if [ -f "$PATCH_JS_PY" ] && [ -f "$LEGACY_PKG/index.js" ]; then
+        if command grep -q 'default:throw new Error(`Unsupported platform' "$LEGACY_PKG/index.js" 2>/dev/null; then
+            python3 "$PATCH_JS_PY" "$LEGACY_PKG" >&2 || \
+                warn "ERROR: patch_js.py failed. Copilot will throw 'Unsupported platform: android/arm64'."
+        fi
+    fi
+}
+
+# --- self-heal shims ------------------------------------------------------
+
+[ -f "$SHIM_LIB" ] || build_shim
+[ -f "$GAI_LIB" ] || build_translator "$GAI_LIB" "$GAI_SRC"
+[ -f "$PTH_LIB" ] || build_translator "$PTH_LIB" "$PTH_SRC"
+
+for pair in "$SHIM_LIB:$SHIM_SRC" "$GAI_LIB:$GAI_SRC" "$PTH_LIB:$PTH_SRC"; do
+    lib="${pair%%:*}"; src="${pair#*:}"
+    if [ -f "$src" ] && [ -f "$lib" ] && [ "$src" -nt "$lib" ]; then
+        if [ "$lib" = "$SHIM_LIB" ]; then build_shim; else build_translator "$lib" "$src"; fi
+    fi
+done
+
+# --- pick entry point ----------------------------------------------------
+
+ENTRY=""
+if [ -f "$MUSL_PKG/index.js" ]; then
+    # 1.0.73+ split package. Re-patch if npm replaced the runtime.
+    runtime_is_patched || patch_musl_runtime || \
+        warn "WARN: could not patch $MUSL_PKG runtime.node - expect a segfault"
+    ENTRY="$MUSL_PKG/index.js"
+elif [ -f "$LEGACY_PKG/index.js" ]; then
+    legacy_selfheal
+    if [ -f "$LEGACY_PKG/npm-loader.js" ]; then
+        ENTRY="$LEGACY_PKG/npm-loader.js"
+    else
+        ENTRY="$LEGACY_PKG/index.js"
     fi
 else
-    # Neither known source layout present — upstream may have moved things again.
-    # Remove any stale patched binaries so node fails with an honest "not found"
-    # rather than a napi-version mismatch from loading the wrong-version binary.
-    if [ -f "$NEW_LAYOUT_DST" ] || [ -f "$OLD_LAYOUT_DST" ]; then
-        rm -f "$NEW_LAYOUT_DST" "$OLD_LAYOUT_DST"
-        echo "[copilot-wrapper] WARN: neither known runtime source layout found in $COPILOT_PKG — removed stale patched binaries. Upstream may have moved things; check /sdcard/Download/copilot-version/README.md." >&2
-    fi
-fi
-
-# JS platform-allowlist patch (idempotent). Required from 1.0.48 onwards: the
-# native-binding loader's libc-variant helper throws "Unsupported platform" on
-# Android before reaching the prebuilds lookup. Patch index.js + app.js to fall
-# through instead of throwing. Re-applies if npm restored fresh JS.
-# Surface failure loudly: if patch_js.py reports the marker is present but the
-# regex didn't match, upstream changed the JS shape — copilot will throw on
-# launch and the user needs to know to update patch_js.py rather than silently
-# get a broken cli.
-if [ -f "$PATCH_JS_PY" ] && [ -f "$COPILOT_PKG/index.js" ]; then
-    if command grep -q 'default:throw new Error(`Unsupported platform' "$COPILOT_PKG/index.js" 2>/dev/null; then
-        if ! python3 "$PATCH_JS_PY" "$COPILOT_PKG" >&2; then
-            echo "[copilot-wrapper] ERROR: patch_js.py failed to apply. Copilot will throw 'Unsupported platform: android/arm64' on launch. See /sdcard/Download/copilot-version/README.md or update shim/patch_js.py to match the new JS shape." >&2
-        fi
-    fi
+    warn "ERROR: no copilot entry point found."
+    warn "       Looked for $MUSL_PKG/index.js and $LEGACY_PKG/index.js."
+    warn "       For 1.0.73+ you need BOTH packages:"
+    warn "         npm install -g @github/copilot"
+    warn "         npm install -g --force @github/copilot-linuxmusl-$ARCH_SUFFIX"
+    warn "       (the second needs --force: its os field is \"linux\", Termux is \"android\")"
+    exit 1
 fi
 
 if [ -f "$SHIM_LIB" ]; then
     export LD_PRELOAD="${SHIM_LIB}${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
-# Note: LD_PRELOAD is intentionally inherited by child processes (MCP servers,
-# worker_threads, fork()'d node, ! shell exec children). Copilot loads
-# runtime.node in worker threads that need __ctype_b_loc and other shim
-# symbols too. The shim is bionic-compatible: its forwarders (bcmp→memcmp,
-# __errno_location→__errno, __xstat64-family→fstat etc.) are no-ops for
-# native bionic binaries because they don't reference those glibc names. The
-# preload.js variant of this wrapper that stripped LD_PRELOAD broke workspace
-# init and MCP host init for that reason — see /sdcard/Download/copilot-version
-# /README.md "LD_PRELOAD scoping" note.
+# LD_PRELOAD is intentionally inherited by children (MCP servers,
+# worker_threads, fork()'d node, ! shell children). The runtime loads in worker
+# threads that need __ctype_b_loc etc. too. The shim is harmless to native
+# bionic binaries since they never reference those glibc names. Note the
+# translator shims are deliberately NOT preloaded - they are scoped to
+# runtime.node via DT_NEEDED so node's own libuv keeps calling bionic.
 
-exec /data/data/com.termux/files/usr/bin/node "$NPM_LOADER" "$@"
+exec /data/data/com.termux/files/usr/bin/node "$ENTRY" "$@"
