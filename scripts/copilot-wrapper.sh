@@ -90,7 +90,30 @@ ANDROID_ARCH="android-arm64"
 
 # Symbols whose .dynstr names get capitalised so they bind to our translators.
 GAI_SYMS="getaddrinfo freeaddrinfo"
+# NOTE: only symbols a module ACTUALLY imports may be listed per-module;
+# rename_imports.py refuses to patch if any named symbol is absent. So each
+# module gets its own set, computed below by intersecting with its imports.
 PTH_SYMS="pthread_mutexattr_init pthread_mutexattr_settype pthread_mutexattr_destroy pthread_mutex_init"
+# pthread_condattr_t is bionic 8 / musl 4 exactly like the mutex attr, and
+# cli-native.node (the TUI renderer) imports it - that is why the interactive
+# path still segfaulted when only runtime.node was patched.
+COND_SYMS="pthread_condattr_init pthread_condattr_destroy pthread_condattr_setclock pthread_condattr_setpshared pthread_condattr_getclock pthread_condattr_getpshared pthread_cond_init"
+MUTEX_EXTRA_SYMS="pthread_mutexattr_gettype pthread_mutexattr_setpshared pthread_mutexattr_getpshared"
+ALL_XLATE_SYMS="$GAI_SYMS $PTH_SYMS $COND_SYMS $MUTEX_EXTRA_SYMS"
+
+# Echo the subset of $ALL_XLATE_SYMS that $1 actually imports (UND in .dynsym),
+# in either the original or already-renamed spelling.
+imported_xlate_syms() {
+    local elf="$1" have sym
+    have=$(readelf --dyn-syms -W "$elf" 2>/dev/null \
+           | command grep ' UND ' | awk '{print $8}' | sort -u)
+    for sym in $ALL_XLATE_SYMS; do
+        local cap="$(printf '%s' "${sym%"${sym#?}"}" | tr 'a-z' 'A-Z')${sym#?}"
+        if printf '%s\n' "$have" | command grep -qx -e "$sym" -e "$cap"; then
+            printf '%s ' "$sym"
+        fi
+    done
+}
 
 warn() { echo "[copilot-wrapper] $*" >&2; }
 
@@ -124,41 +147,69 @@ build_translator() {
 
 # --- 1.0.73+ split-package path -------------------------------------------
 
-patch_musl_runtime() {
-    # Idempotent. rename_imports.py refuses to double-apply (it verifies the
-    # exact expected bytes), and patchelf --add-needed is a no-op if present.
-    local dir="$MUSL_PKG/prebuilds/linuxmusl-$ARCH_SUFFIX"
-    local rt="$dir/runtime.node"
-    [ -f "$rt" ] || return 1
-    [ -f "$RENAME_PY" ] || { warn "missing $RENAME_PY"; return 1; }
-
-    cp -f "$GAI_LIB" "$PTH_LIB" "$dir/" 2>/dev/null
-
-    # Already patched? Then the renamed symbols are present and originals gone.
-    if python3 "$RENAME_PY" --check "$rt" $GAI_SYMS $PTH_SYMS >/dev/null 2>&1; then
-        # Originals still present -> needs renaming.
-        python3 "$RENAME_PY" "$rt" $GAI_SYMS $PTH_SYMS >/dev/null 2>&1 || {
-            warn "ERROR: .dynstr rename failed on $rt. Copilot will segfault."
-            warn "       Upstream may have changed the import set; run:"
-            warn "       python3 $RENAME_PY --check $rt $GAI_SYMS $PTH_SYMS"
-            return 1
-        }
+patch_one_node() {
+    # $1 = path to a musl-built .node module. Idempotent: rename_imports.py
+    # verifies the exact expected bytes and refuses to double-apply, and
+    # patchelf --add-needed is a no-op when the entry already exists.
+    local elf="$1" syms
+    [ -f "$elf" ] || return 0          # module absent in this version, fine
+    syms="$(imported_xlate_syms "$elf")"
+    if [ -n "$syms" ]; then
+        if python3 "$RENAME_PY" --check "$elf" $syms >/dev/null 2>&1; then
+            python3 "$RENAME_PY" "$elf" $syms >/dev/null 2>&1 || {
+                warn "ERROR: .dynstr rename failed on $elf. Copilot will segfault."
+                warn "       python3 $RENAME_PY --check $elf $syms"
+                return 1
+            }
+        fi
     fi
-
+    # patchelf --add-needed does NOT deduplicate, so check first. A duplicate
+    # DT_NEEDED is harmless at runtime but grows on every launch.
+    local needed
+    needed=$(readelf -d "$elf" 2>/dev/null | command grep NEEDED)
     for lib in libm.so libdl.so libgai_xlate.so libpthread_xlate.so; do
-        patchelf --add-needed "$lib" "$rt" 2>/dev/null
+        printf '%s\n' "$needed" | command grep -qF "[$lib]" || \
+            patchelf --add-needed "$lib" "$elf" 2>/dev/null
     done
-    patchelf --set-rpath '$ORIGIN' "$rt" 2>/dev/null
-
-    # detect-libc says "glibc" on bionic, so the loader looks in linux-arm64.
-    ln -sfn "linuxmusl-$ARCH_SUFFIX" "$MUSL_PKG/prebuilds/linux-$ARCH_SUFFIX" 2>/dev/null
+    patchelf --set-rpath '$ORIGIN' "$elf" 2>/dev/null
     return 0
 }
 
+patch_musl_runtime() {
+    local dir="$MUSL_PKG/prebuilds/linuxmusl-$ARCH_SUFFIX"
+    [ -d "$dir" ] || return 1
+    [ -f "$RENAME_PY" ] || { warn "missing $RENAME_PY"; return 1; }
+    [ -f "$dir/runtime.node" ] || return 1
+
+    cp -f "$GAI_LIB" "$PTH_LIB" "$dir/" 2>/dev/null
+
+    # EVERY musl .node in the dir needs this, not just runtime.node.
+    # cli-native.node drives the TUI and imports pthread_mutexattr_* AND
+    # pthread_condattr_* - leaving it unpatched segfaults the interactive path
+    # (~60% of launches) while headless -p prompts look completely fine.
+    local rc=0 f
+    for f in "$dir"/*.node; do
+        [ -f "$f" ] || continue
+        patch_one_node "$f" || rc=1
+    done
+
+    # detect-libc says "glibc" on bionic, so the loader looks in linux-arm64.
+    ln -sfn "linuxmusl-$ARCH_SUFFIX" "$MUSL_PKG/prebuilds/linux-$ARCH_SUFFIX" 2>/dev/null
+    return $rc
+}
+
 runtime_is_patched() {
-    local rt="$MUSL_PKG/prebuilds/linuxmusl-$ARCH_SUFFIX/runtime.node"
-    [ -f "$rt" ] || return 1
-    readelf -d "$rt" 2>/dev/null | command grep -q 'libpthread_xlate\.so'
+    # Every .node in the dir must carry the translator, and none may still have
+    # an un-renamed attr import. Either condition failing triggers a re-patch.
+    local dir="$MUSL_PKG/prebuilds/linuxmusl-$ARCH_SUFFIX" f
+    [ -f "$dir/runtime.node" ] || return 1
+    for f in "$dir"/*.node; do
+        [ -f "$f" ] || continue
+        readelf -d "$f" 2>/dev/null | command grep -q 'libpthread_xlate\.so' || return 1
+        readelf --dyn-syms -W "$f" 2>/dev/null | command grep ' UND ' | awk '{print $8}' \
+            | command grep -q -e '^pthread_mutexattr' -e '^pthread_condattr' && return 1
+    done
+    return 0
 }
 
 # --- legacy (<=1.0.72) single-package path ---------------------------------
@@ -267,5 +318,39 @@ fi
 # bionic binaries since they never reference those glibc names. Note the
 # translator shims are deliberately NOT preloaded - they are scoped to
 # runtime.node via DT_NEEDED so node's own libuv keeps calling bionic.
+
+# ---------------------------------------------------------------------------
+# TLS trust store (fixes "auth failed" + the follow-on SIGSEGV)
+# ---------------------------------------------------------------------------
+# The Rust runtime uses rustls-native-certs, which probes the standard Linux
+# paths (/etc/ssl/certs, /etc/ssl/cert.pem, ...). NONE of those exist on
+# Android - the system store is /system/etc/security/cacerts (individual
+# hash-named files, not a bundle). So the runtime loads ZERO roots and every
+# HTTPS request fails at client-build time with:
+#
+#     request failed: builder error: unexpected error:
+#     No CA certificates were loaded from the system
+#
+# Symptoms: "Authentication token found but could not be validated", "Failed to
+# fetch OAuth user login", MCP servers over HTTPS refusing to connect, and then
+# a SIGSEGV inside the TUI (the cert failure path crashes rather than erroring
+# out cleanly - reproducible under a pty, and it goes away entirely once roots
+# load). It looks like a broken install but the token is fine.
+#
+# Verified A/B under a real pty on 1.0.76:
+#   no SSL_CERT_FILE  -> SIGSEGV (signal 11), auth errors on screen
+#   SSL_CERT_FILE set -> exit 0, auth fine
+#
+# Termux ships the ca-certificates bundle, so point rustls at it. Only set it
+# if the caller has not, and only if the bundle actually exists.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -f /data/data/com.termux/files/usr/etc/tls/cert.pem ]; then
+    export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
+fi
+if [ -z "${SSL_CERT_DIR:-}" ] && [ -d /data/data/com.termux/files/usr/etc/tls ]; then
+    export SSL_CERT_DIR=/data/data/com.termux/files/usr/etc/tls
+fi
+if [ -z "${NODE_EXTRA_CA_CERTS:-}" ] && [ -f "${SSL_CERT_FILE:-}" ]; then
+    export NODE_EXTRA_CA_CERTS="$SSL_CERT_FILE"
+fi
 
 exec /data/data/com.termux/files/usr/bin/node "$ENTRY" "$@"

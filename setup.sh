@@ -204,7 +204,10 @@ if [ "$UPDATE_MODE" = true ]; then
   #      up new symbol forwarders when upstream copilot adds glibc probes) ----
   REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   mkdir -p "$SHIM_DIR"
-  for f in bionic_shim.c strip_verneed.py patch_js.py; do
+  # gai_xlate.c/pthread_xlate.c/rename_imports.py are what fix the 1.0.61+ and
+  # TUI segfaults - without them the wrapper cannot self-heal at all.
+  for f in bionic_shim.c strip_verneed.py patch_js.py \
+           gai_xlate.c pthread_xlate.c rename_imports.py; do
     if [ -f "$REPO_DIR/shim/$f" ] && { [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; }; then
       cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
       echo "✓ Synced $f from repo (your $f was stale or missing)"
@@ -413,6 +416,11 @@ ensure_pkg nodejs node
 ensure_pkg clang clang
 ensure_pkg make make
 ensure_pkg python python
+# The Rust runtime's rustls-native-certs finds NO trust store on Android
+# (/etc/ssl/* do not exist), so every HTTPS request dies with "No CA
+# certificates were loaded from the system" -> auth failure + a TUI segfault.
+# The wrapper points SSL_CERT_FILE at this bundle; make sure it exists.
+ensure_pkg ca-certificates
 
 # Create .gyp configuration for node-gyp (fixes android ndk path issues)
 # Non-destructive: only create if missing
@@ -438,6 +446,22 @@ if npm install -g @github/copilot; then
 else
     print_error "Failed to install GitHub Copilot CLI globally"
     exit 1
+fi
+
+# 1.0.73+ split the package: @github/copilot is a ~5KB loader stub and the real
+# binaries live in a per-platform optional dep. npm SKIPS it silently because its
+# os field is "linux" while Termux reports "android", so it must be forced.
+# Without this a fresh install has no runtime.node/cli-native.node at all.
+if [ ! -d "$INSTALL_ROOT/prebuilds" ] && [ ! -d "$INSTALL_ROOT/native" ]; then
+    # No binaries under the stub => split-package layout (1.0.73+).
+    MUSL_PKG_NAME="@github/copilot-linuxmusl-${ANDROID_ARCH#android-}"
+    print_info "1.0.73+ layout: installing $MUSL_PKG_NAME (needs --force on Termux)"
+    if npm install -g --force "$MUSL_PKG_NAME" 2>&1 | command grep -v "^npm warn using --force"; then
+        print_info "Platform package installed"
+    else
+        print_warning "Could not install $MUSL_PKG_NAME - copilot will not start."
+        print_warning "  Retry manually: npm install -g --force $MUSL_PKG_NAME"
+    fi
 fi
 
 if [ ! -d "$INSTALL_ROOT" ]; then
@@ -870,7 +894,8 @@ if [ ! -f "$REPO_DIR/shim/bionic_shim.c" ]; then
   exit 1
 fi
 SYNCED=0
-for f in bionic_shim.c strip_verneed.py patch_js.py; do
+for f in bionic_shim.c strip_verneed.py patch_js.py \
+         gai_xlate.c pthread_xlate.c rename_imports.py; do
   if [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; then
     cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
     SYNCED=$((SYNCED+1))

@@ -36,6 +36,8 @@ This repo provides a single `setup.sh` that:
 | 1.0.48+ `prebuilds/linux-arm64/runtime.node` is glibc-only | Copy to `prebuilds/android-arm64/runtime.node`, strip GLIBC symbol versions (`strip_verneed.py`), drop `libgcc_s`/`libpthread`/`libdl` NEEDED, rename `libc.so.6→libc.so`, `libm.so.6→libm.so` |
 | 1.0.48+ JS throws "Unsupported platform" | `patch_js.py` rewrites the `default:throw` in `index.js`+`app.js` to fall through |
 | musl/glibc symbols missing on bionic | LD_PRELOAD shim exports `bcmp`, `__xpg_strerror_r`, `__errno_location`, `__xstat64`/`__lxstat64`/`__fxstat64`/`__fxstatat64`, `__ctype_b_loc`, `__assert_fail`, and statically-linked `_Unwind_*` (from Termux `libunwind.a`) |
+| `pthread_mutexattr_t`/`pthread_condattr_t` are 8 bytes on bionic, 4 on musl | `.dynstr` import rename + `libpthread_xlate.so`, applied to **every** `*.node` (`runtime.node` and `cli-native.node`) |
+| No CA trust store on Android, so all HTTPS fails at client-build time | Wrapper exports `SSL_CERT_FILE=$PREFIX/etc/tls/cert.pem` |
 | npm update wipes all patches | Self-healing wrapper at `~/.local/bin/copilot` re-applies on launch |
 
 ## Prerequisites
@@ -146,6 +148,25 @@ cp "$COPILOT_PKG/native/runtime/runtime.linux-arm64-musl.node" \
 patchelf --add-needed libm.so "$COPILOT_PKG/native/runtime/runtime.android-arm64.node"
 ```
 
+### "Authentication token found but could not be validated"
+Missing CA trust store, not a bad token. Quick check:
+```bash
+pkg install ca-certificates
+export SSL_CERT_FILE=$PREFIX/etc/tls/cert.pem
+```
+If that fixes it, your wrapper is out of date - re-run `./setup.sh --update`.
+Full explanation below under "SOLVED: auth failed (no fetch)".
+
+### Segfault the moment the TUI paints
+A separate bug from the auth one. `cli-native.node` needs the same
+`pthread_*attr_t` width patch as `runtime.node`. Check:
+```bash
+readelf -d ~/.npm-global/lib/node_modules/@github/copilot-linuxmusl-arm64/\
+prebuilds/linuxmusl-arm64/cli-native.node | grep libpthread_xlate
+```
+No output means unpatched - re-run `./setup.sh --update`. See "SOLVED: the TUI
+segfault" below.
+
 ### "Failed to load native module: pty.node"
 The prebuild was wiped. Run `./setup.sh --update` to restore from backup.
 
@@ -162,7 +183,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → 1.0.48 (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, and `libunwind.a` from `ndk-sysroot`)
+- `@github/copilot` 1.0.45 → **1.0.78** (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 
@@ -175,6 +196,174 @@ Once the installation is complete, you can start the GitHub Copilot CLI by runni
 ```bash
 copilot
 ```
+
+## SOLVED: "auth failed" (no fetch) (fixed 2026-08-05)
+
+These two failures look like one bug because they usually appear together, but
+they are **independent** and were fixed separately. Verified by isolating each:
+
+| symptom | cause | fixed by |
+|---|---|---|
+| auth fails, `builder error`, MCP over HTTPS refuses | no CA trust store on Android | `SSL_CERT_FILE` in the wrapper |
+| SIGSEGV as soon as the TUI paints | `cli-native.node` unpatched (`pthread_*attr_t` 8-vs-4) | `.dynstr` rename + `libpthread_xlate.so` |
+
+Proof they are independent, on 1.0.78 under a pty that answers terminal
+capability queries so the TUI really renders:
+
+| trust store | `cli-native.node` | result |
+|---|---|---|
+| present | patched | exit 0, TUI renders |
+| present | **unpatched** | **SIGSEGV 3/3** |
+| **absent** | patched | exit 0 - clean auth error on screen, no crash |
+
+The middle row is the one that matters: certs were fine and it still crashed. So
+a missing trust store never caused the segfault; it only breaks the network.
+
+Symptoms of the trust-store half, on a version that otherwise works:
+
+```
+Authentication token found but could not be validated.
+Failed to fetch OAuth user login: network fetch failed: request failed: builder error
+Failed to fetch GitHub CLI user login: network fetch failed: request failed: builder error
+Failed to connect to MCP server "...": failed to build Streamable HTTP client: builder error
+Segmentation fault
+```
+
+This looks like a broken install or an expired token. It is neither: **the token
+is fine.** The runtime just cannot find any CA certificates. The give-away is in
+`~/.copilot/logs/process-*.log`:
+
+```
+[ERROR] Failed to fetch latest release: HttpError: request failed: builder error:
+        builder error: unexpected error: No CA certificates were loaded from the system
+```
+
+### Why
+
+The Rust runtime uses `rustls-native-certs`, which probes the standard Linux
+trust-store paths. **None of them exist on Android:**
+
+| path | on Android |
+|---|---|
+| `/etc/ssl/certs` | missing |
+| `/etc/ssl/cert.pem` | missing |
+| `/system/etc/security/cacerts` | present, but individual hash-named files, not a bundle |
+| `$PREFIX/etc/tls/cert.pem` | present (Termux `ca-certificates`) |
+
+So zero roots load and every HTTPS client fails at *build* time - which is why
+the message is `builder error` rather than a handshake or certificate error.
+Auth, update checks, and any HTTPS MCP server all fail together.
+
+More precisely, the failing layer is `rustls-platform-verifier`: because the
+addon is compiled for `linux-musl` and not `target_os = "android"`, Rust
+conditional compilation picks the Unix branch, which calls
+`rustls_native_certs::load_native_certs()` and errors during *verifier
+construction* when the resulting root store is empty. It cannot discover at
+runtime that it should be using Android's `TrustManager` - that needs an Android
+target plus JNI, so no environment variable can reach it. `rustls-native-certs`
+0.8.x does read `SSL_CERT_FILE` itself, which is why pointing it at a bundle is
+a real fix at the right layer and not a workaround at the wrong one.
+
+### Fix
+
+The wrapper now exports the Termux bundle before exec'ing node, each variable
+only if the caller has not already set it and only if the path exists:
+
+```bash
+SSL_CERT_FILE=$PREFIX/etc/tls/cert.pem
+SSL_CERT_DIR=$PREFIX/etc/tls
+NODE_EXTRA_CA_CERTS=$PREFIX/etc/tls/cert.pem
+```
+
+**`SSL_CERT_FILE` alone is what actually fixes it.** The other two are belt and
+braces and should not be read as required: `SSL_CERT_DIR` only helps on
+`rustls-native-certs` 0.8+ (0.7 documented no directory loading), and
+`NODE_EXTRA_CA_CERTS` touches only node's own TLS stack, which is a completely
+separate root set from rustls and already ships Mozilla's roots. Keep the last
+one only if your *node-side* HTTPS needs a private CA. `setup.sh` now also
+installs `ca-certificates`.
+
+Note this bug is **environment-dependent**, which makes it easy to misattribute:
+if some other tool in your shell profile already exports `SSL_CERT_FILE`,
+Copilot works, and it only breaks in shells that don't.
+
+Also note what the bundle is *not*: a reproduction of Android's trust policy. It
+is the curl/Mozilla public-WebPKI set (145 roots vs 149 in the system store).
+Concatenating `/system/etc/security/cacerts` instead would not be an
+improvement - since Android 14 roots can also come from the updatable Conscrypt
+APEX, Android tracks *removed* certificates separately (so a raw read can
+re-trust a root the platform distrusts), and MDM/work-profile CAs may live in a
+per-user store Termux cannot read at all. If you are behind a TLS-inspecting
+corporate proxy, append your organisation's root to the bundle explicitly:
+
+```bash
+cat $PREFIX/etc/tls/cert.pem corp-root.pem > ~/.copilot-ca.pem
+export SSL_CERT_FILE=~/.copilot-ca.pem   # the wrapper honours a pre-set value
+```
+
+## SOLVED: the TUI segfault (fixed 2026-08-05)
+
+After the 1.0.61+ fix below, headless `copilot -p "..."` worked perfectly but
+plain `copilot` still died with SIGSEGV the moment the TUI painted. The reason is
+embarrassingly simple: **`runtime.node` was not the only musl module that needed
+patching.** 1.0.76 added `cli-native.node` (2.5 MB, the TUI renderer), and it was
+shipping with `DT_NEEDED` = `libc.so` only. Its imports:
+
+```
+getaddrinfo  freeaddrinfo
+pthread_mutexattr_init  pthread_mutexattr_settype  pthread_mutexattr_destroy
+pthread_condattr_init   pthread_condattr_destroy
+```
+
+The mutexattr three are the exact bug documented below. `pthread_condattr_t` is
+the **same 8-vs-4 hazard** (bionic `long`, musl `unsigned`) - previously listed
+as "latent, not imported", which was true of `runtime.node` but not of this new
+module. So the interactive path had an unpatched copy of the original bug plus a
+second instance of it, which is why only the TUI died.
+
+### Fix
+
+`libpthread_xlate.so` gained `pthread_condattr_init/destroy/setclock/setpshared/
+getclock/getpshared` and `pthread_cond_init`, plus the mutexattr getters, so no
+bionic entry point can ever receive the 4-byte pointer. 14 translated symbols in
+total. The wrapper now loops over **every** `*.node` in the prebuilds dir instead
+of hard-coding `runtime.node`, computing each module's symbol subset from its own
+`UND` imports (`rename_imports.py` refuses to run if a named symbol is absent).
+
+### Verification (1.0.78, pty that answers terminal capability queries)
+
+The harness must reply to `DA`/`DSR`/`OSC` colour queries, otherwise the TUI
+waits forever and never reaches the crash site - which is exactly how this bug
+hid behind a "working" `--version` and a piped-stdin test.
+
+| `cli-native.node` | runs | result |
+|---|---|---|
+| patched | 6/6 | exit 0, TUI renders fully |
+| pristine from the npm tarball | 3/3 | **SIGSEGV**, ~7.6 s, every time |
+
+Deterministic in both directions, with the CA bundle present throughout - so this
+is independent of the trust-store bug above. Also verified: the wrapper
+self-heals both modules automatically after a fresh `npm install -g` of 1.0.78
+(fresh binaries land with 1 `DT_NEEDED` and 5-7 raw imports; after one launch,
+5 `DT_NEEDED` with the translator first and 0 unrenamed).
+
+### Coverage audit on 1.0.78
+
+Both modules import only equal-width pthread types beyond the renamed set
+(`pthread_attr_t` 56/56, `pthread_cond_t` 48/48, `pthread_mutex_t` 40/40,
+`pthread_rwlock_t` 56/56) and no `sem_*` or `pthread_spin_*`. Re-run after every
+upgrade:
+
+```bash
+for f in ~/.npm-global/lib/node_modules/@github/copilot-linuxmusl-arm64/\
+prebuilds/linuxmusl-arm64/*.node; do
+  echo "== $f"
+  readelf --dyn-syms -W "$f" | grep ' UND ' | awk '{print $8}' \
+    | grep -e '[Pp]thread' -e '^sem_' -e spin | sort -u
+done
+```
+
+Anything lowercase and attr-bearing in that output is a new instance of the bug.
 
 ## SOLVED: the 1.0.61+ segfault (fixed 2026-07-30, ceiling lifted)
 
@@ -265,24 +454,26 @@ Pthread_mutexattr_init  Pthread_mutexattr_settype
 Pthread_mutexattr_destroy  Pthread_mutex_init      <- renamed, ours
 ```
 
-There are **no** imports of `pthread_condattr_*`, `pthread_spin_*`, `sem_*`, or
-`pthread_mutexattr_get*/setpshared/setprotocol`, so the two latent 8-vs-4 types
-below are genuinely unreachable today. `pthread_attr_t`, `pthread_rwlock_t`,
+`runtime.node` has **no** imports of `pthread_condattr_*`, `pthread_spin_*`,
+`sem_*`, or `pthread_mutexattr_get*/setpshared/setprotocol`. Note this audit
+covers `runtime.node` **only**, and that was the trap: `cli-native.node` *does*
+import `pthread_condattr_*`, which is the TUI segfault documented above. Always
+audit every `*.node` in the directory, not just the runtime.
+`pthread_attr_t`, `pthread_rwlock_t`,
 `pthread_once_t` and `pthread_key_t` are all equal-or-larger on bionic and are
 created and consumed entirely by bionic, so they are safe (their internal
 encodings differ, but no object ever crosses libcs).
 
 ### Related ABI widths worth watching
 
-Bionic is **wider** than musl for three types on aarch64 LP64. Only the first is
-currently imported by `runtime.node`, but re-audit if a future release adds
-pthread calls:
+Bionic is **wider** than musl for three types on aarch64 LP64. Two of the three
+have now actually bitten:
 
 | type | bionic | musl | status |
 |---|---|---|---|
-| `pthread_mutexattr_t` | 8 | 4 | **was the bug** |
-| `pthread_condattr_t` | 8 | 4 | latent, not imported |
-| `pthread_spinlock_t` | 8 | 4 | latent, not imported |
+| `pthread_mutexattr_t` | 8 | 4 | **the 1.0.61+ bug**, imported by both modules |
+| `pthread_condattr_t` | 8 | 4 | **the TUI segfault**, imported by `cli-native.node` |
+| `pthread_spinlock_t` | 8 | 4 | latent - not imported by any module yet |
 
 `pthread_mutex_t` (40), `pthread_cond_t` (48), `pthread_rwlock_t` (56),
 `pthread_attr_t` (56), `pthread_barrier_t` (32), `pthread_once_t` (4) and
