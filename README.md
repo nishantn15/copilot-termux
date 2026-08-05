@@ -167,6 +167,52 @@ prebuilds/linuxmusl-arm64/cli-native.node | grep libpthread_xlate
 No output means unpatched - re-run `./setup.sh --update`. See "SOLVED: the TUI
 segfault" below.
 
+### "Ignoring unknown top-level key(s) in user settings file"
+Cosmetic, not a Termux bug - your `~/.copilot/settings.json` has a key the
+runtime does not recognise. Two common causes:
+
+- **A dotted key that should be nested.** `"builtInAgents.rubberDuck": true` is
+  ignored; the reader is `settings.builtInAgents?.rubberDuck`, so it has to be
+  `"builtInAgents": { "rubberDuck": true }`.
+- **A key that has since been retired.** The rubber-duck keys in particular are
+  legacy: `rubber-duck` is now an ordinary built-in agent gated by a feature
+  flag, and the CLI ships a `migrateLegacyRubberDuckSettingsOnDisk` routine that
+  drops them. Delete rather than nest them - with no `builtInAgents` key at all,
+  `rubber-duck` still appears in the agent list.
+
+Do **not** grep `app.js` to decide whether a key is valid - `renderMarkdown` has
+zero hits there and is perfectly valid. Ask the Rust runtime for the real list
+(84 keys as of 1.0.78) and diff your file against it:
+
+```bash
+cat > "$PREFIX/tmp/val.cjs" <<'EOF'
+const rt = process.env.HOME +
+  "/.npm-global/lib/node_modules/@github/copilot-linuxmusl-arm64" +
+  "/prebuilds/linuxmusl-arm64/runtime.node";
+const known = new Set(JSON.parse(require(rt).userSettingsKeysJson()));
+known.add("$schema");
+const s = JSON.parse(require("fs")
+  .readFileSync(process.env.HOME + "/.copilot/settings.json", "utf8"));
+const bad = Object.keys(s).filter(k => !known.has(k));
+console.log("keys=" + Object.keys(s).length +
+            "  unknown=" + (bad.length ? bad.join(",") : "NONE"));
+EOF
+env SSL_CERT_FILE="$PREFIX/etc/tls/cert.pem" \
+    LD_PRELOAD="$HOME/.copilot-versions/shim/libbionic_shim.so" \
+    node "$PREFIX/tmp/val.cjs"
+```
+
+It must be `.cjs` (or `node -e`) - as ESM you get `require is not defined`. The
+two env vars are needed because loading `runtime.node` on bionic pulls in the
+shim and the CA bundle.
+
+Note only **top-level** keys are checked, so a typo nested inside a valid object
+is silently ignored with no warning at all.
+
+**Gotcha:** `XDG_CONFIG_HOME` does *not* relocate Copilot's config dir, so you
+cannot A/B a settings change by pointing it at a scratch directory - it keeps
+reading `~/.copilot/settings.json`. Back that file up and edit it in place.
+
 ### "Failed to load native module: pty.node"
 The prebuild was wiped. Run `./setup.sh --update` to restore from backup.
 
