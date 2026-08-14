@@ -221,6 +221,17 @@ if [ "$UPDATE_MODE" = true ]; then
     chmod +x "$HOME/.local/bin/copilot"
     echo "✓ Refreshed launcher wrapper from repo"
   fi
+  # Interactive-TUI crash harness. Installed next to the shim dir, NOT in
+  # $PREFIX/tmp (wiped on restart - and a missing harness fails as an empty
+  # result line, which reads exactly like a pass). Needed to verify each new
+  # upstream version: the TUI segfault does not reproduce over piped stdin.
+  if [ -f "$REPO_DIR/scripts/pty_tui_test.py" ] && \
+     { [ ! -f "$HOME/.copilot-versions/pty_tui_test.py" ] || \
+       ! cmp -s "$REPO_DIR/scripts/pty_tui_test.py" "$HOME/.copilot-versions/pty_tui_test.py"; }; then
+    cp -f "$REPO_DIR/scripts/pty_tui_test.py" "$HOME/.copilot-versions/pty_tui_test.py"
+    chmod +x "$HOME/.copilot-versions/pty_tui_test.py"
+    echo "✓ Installed TUI test harness (~/.copilot-versions/pty_tui_test.py)"
+  fi
 
   # ---- Build / refresh the shim ----
   if ! command -v clang >/dev/null 2>&1; then
@@ -903,6 +914,19 @@ for f in bionic_shim.c strip_verneed.py patch_js.py \
 done
 [ "$SYNCED" -gt 0 ] && print_success "Synced $SYNCED shim source file(s) from repo → $SHIM_DIR" \
                    || print_info "Shim sources already up to date"
+
+# Install the interactive-TUI crash harness one level up from the shim sources.
+# It goes in ~/.copilot-versions/ rather than $PREFIX/tmp on purpose: tmp is
+# wiped on restart, and a missing harness fails as an empty result line, which
+# reads exactly like a passing run. Needed to verify a new upstream version -
+# the TUI segfault does NOT reproduce over piped stdin.
+TUI_HARNESS="$HOME/.copilot-versions/pty_tui_test.py"
+if [ -f "$REPO_DIR/scripts/pty_tui_test.py" ] && \
+   { [ ! -f "$TUI_HARNESS" ] || ! cmp -s "$REPO_DIR/scripts/pty_tui_test.py" "$TUI_HARNESS"; }; then
+  cp -f "$REPO_DIR/scripts/pty_tui_test.py" "$TUI_HARNESS"
+  chmod +x "$TUI_HARNESS"
+  print_success "Installed TUI test harness ($TUI_HARNESS)"
+fi
 
 # Build / refresh shim binary. With libunwind.a for _Unwind_* exports.
 if [ ! -f "$SHIM_LIB" ] || [ "$SHIM_SRC" -nt "$SHIM_LIB" ]; then

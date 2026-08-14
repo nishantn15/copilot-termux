@@ -182,7 +182,7 @@ runtime does not recognise. Two common causes:
 
 Do **not** grep `app.js` to decide whether a key is valid - `renderMarkdown` has
 zero hits there and is perfectly valid. Ask the Rust runtime for the real list
-(84 keys as of 1.0.78) and diff your file against it:
+(85 keys as of 1.0.80) and diff your file against it:
 
 ```bash
 cat > "$PREFIX/tmp/val.cjs" <<'EOF'
@@ -229,7 +229,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → **1.0.78** (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
+- `@github/copilot` 1.0.45 → **1.0.80** (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 
@@ -376,26 +376,61 @@ total. The wrapper now loops over **every** `*.node` in the prebuilds dir instea
 of hard-coding `runtime.node`, computing each module's symbol subset from its own
 `UND` imports (`rename_imports.py` refuses to run if a named symbol is absent).
 
-### Verification (1.0.78, pty that answers terminal capability queries)
+### Verification (pty that answers terminal capability queries)
 
 The harness must reply to `DA`/`DSR`/`OSC` colour queries, otherwise the TUI
 waits forever and never reaches the crash site - which is exactly how this bug
-hid behind a "working" `--version` and a piped-stdin test.
+hid behind a "working" `--version` and a piped-stdin test. Harness:
+`~/.copilot-versions/pty_tui_test.py`, installed by `setup.sh` from
+`scripts/pty_tui_test.py` (deliberately *not* in `$PREFIX/tmp`, which gets wiped
+on restart - a missing harness fails silently as an empty result line, which
+reads exactly like a pass).
 
-| `cli-native.node` | runs | result |
+```bash
+python3 ~/.copilot-versions/pty_tui_test.py            # patched build
+COPILOT_CMD=<unpatched-launcher> python3 ~/.copilot-versions/pty_tui_test.py
+```
+
+Reading `RESULT=`: `EXIT 0` with `visible` in the hundreds is a pass; `SIGNAL 11`
+is the bug; `HANG` means the app ignored every `/exit` and the harness killed it,
+which is **not** a crash - judge those on `visible`. Two traps the harness now
+handles, both of which produced phantom failures while testing 1.0.80:
+
+- A `SIGKILL`ed copilot leaves its session registered and the WAL mid-flight, and
+  the *next* startup then stalls in "Session has been disposed" /
+  "NativeMcpHostHandle has been destroyed" cleanup and renders nothing. That
+  looks like a fresh bug but is self-inflicted. The harness now escalates
+  SIGINT -> SIGTERM -> SIGKILL, and it is worth pausing ~10 s between runs.
+- On a crash the pty reaches EOF a moment *before* the child becomes waitable, so
+  a single `waitpid(WNOHANG)` reports neither exit nor signal and a genuine
+  SIGSEGV gets logged as a hang. The harness polls for up to 3 s instead.
+
+| `cli-native.node` | 1.0.78 | 1.0.80 |
 |---|---|---|
-| patched | 6/6 | exit 0, TUI renders fully |
-| pristine from the npm tarball | 3/3 | **SIGSEGV**, ~7.6 s, every time |
+| patched | 6/6 exit 0, full render | 7/7 exit 0, full render (`visible` 800-900) |
+| pristine from the npm tarball | 3/3 **SIGSEGV** ~7.6 s | 6/8 **SIGSEGV** ~7.4 s, 2/8 clean pass |
 
-Deterministic in both directions, with the CA bundle present throughout - so this
-is independent of the trust-store bug above. Also verified: the wrapper
-self-heals both modules automatically after a fresh `npm install -g` of 1.0.78
-(fresh binaries land with 1 `DT_NEEDED` and 5-7 raw imports; after one launch,
-5 `DT_NEEDED` with the translator first and 0 unrenamed).
+Both directions verified with the CA bundle present throughout, so this is
+independent of the trust-store bug above. Run the pristine control **on every new
+version**, not just once: it is what proves the harness can still detect the
+crash. A patched-only sweep cannot distinguish "fixed" from "harness went blind".
 
-### Coverage audit on 1.0.78
+The control is **not** deterministic on 1.0.80 (it was on 1.0.78): 2 of 8 runs
+rendered fine. Expected for stack corruption - which callee-saved register the
+8-byte store lands on depends on the caller's frame, so some frames survive it.
+Practical consequence: **never conclude anything from a single control run**, and
+note that crashes are sharply bimodal in time here - a crash lands at ~7.4 s,
+a survivor reaches `/exit` at ~23 s.
 
-Both modules import only equal-width pthread types beyond the renamed set
+Also verified: the wrapper self-heals both modules automatically after a fresh
+`npm install -g` (fresh binaries land with 1 `DT_NEEDED` and raw imports; after
+one launch, 5 `DT_NEEDED` with the translator first and 0 unrenamed), and stays
+idempotent across many launches (5 `NEEDED` entries, 5 unique - no duplicates).
+
+### Coverage audit (re-run on every upgrade)
+
+Verified clean on 1.0.78 and 1.0.80: both modules import only
+equal-width pthread types beyond the renamed set
 (`pthread_attr_t` 56/56, `pthread_cond_t` 48/48, `pthread_mutex_t` 40/40,
 `pthread_rwlock_t` 56/56) and no `sem_*` or `pthread_spin_*`. Re-run after every
 upgrade:

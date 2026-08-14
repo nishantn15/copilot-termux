@@ -5,6 +5,7 @@
  * Statically links libunwind.a to provide _Unwind_* symbols.
  */
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
