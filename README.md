@@ -232,6 +232,9 @@ Termux does not map 1003, so tracking never turns on, and in the alternate
 screen Termux converts vertical swipes into `DPAD_UP`/`DPAD_DOWN` key presses.
 Those arrows land in the prompt box, which owns Up/Down for history.
 
+Confirmed on a real device: after the patch, swiping scrolls the transcript. So
+Termux does activate tracking on 1002 and does not on 1003.
+
 `shim/patch_mouse.py` adds mode 1002 alongside 1003. They are independent bits,
 so terminals that honour 1003 lose nothing, and copilot's own `MOUSE_OFF`
 already sends `1002l`, so the terminal is not left reporting mouse events after
