@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 """Strip GLIBC symbol versioning and DT_VERNEED/DT_VERSYM entries from a
 glibc-built ELF shared object so it can dlopen on Termux/Android bionic.
 

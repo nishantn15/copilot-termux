@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/data/data/com.termux/files/usr/bin/bash
 
 # Ensure running under Termux
 if [ -z "${TERMUX_VERSION:-}" ]; then
@@ -207,7 +207,7 @@ if [ "$UPDATE_MODE" = true ]; then
   # gai_xlate.c/pthread_xlate.c/rename_imports.py are what fix the 1.0.61+ and
   # TUI segfaults - without them the wrapper cannot self-heal at all.
   for f in bionic_shim.c strip_verneed.py patch_js.py \
-           gai_xlate.c pthread_xlate.c rename_imports.py; do
+           gai_xlate.c pthread_xlate.c rename_imports.py patch_mouse.py; do
     if [ -f "$REPO_DIR/shim/$f" ] && { [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; }; then
       cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
       echo "✓ Synced $f from repo (your $f was stale or missing)"
@@ -906,7 +906,7 @@ if [ ! -f "$REPO_DIR/shim/bionic_shim.c" ]; then
 fi
 SYNCED=0
 for f in bionic_shim.c strip_verneed.py patch_js.py \
-         gai_xlate.c pthread_xlate.c rename_imports.py; do
+         gai_xlate.c pthread_xlate.c rename_imports.py patch_mouse.py; do
   if [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; then
     cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
     SYNCED=$((SYNCED+1))

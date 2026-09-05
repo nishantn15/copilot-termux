@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 """Patch @github/copilot's minified JS so process.platform === 'android' no longer
 throws "Unsupported platform". The native-binding loader has a libc-variant
 helper that switches on process.platform with cases for win32/darwin/linux only

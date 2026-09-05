@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 """Interactive-TUI crash harness for copilot on Termux/bionic.
 
 Why this exists: the 1.0.61+ pthread-attr-width segfault only reproduces on the
@@ -28,6 +28,8 @@ Usage:  python3 pty_tui_test.py [--nossl] [--noexit] [--wait SEC]
   --nossl   point the cert vars at a nonexistent file, defeating the wrapper's
             -z guard, to prove a missing trust store errors instead of crashing
   --noexit  do not send /exit; let it run to --wait then report
+  --raw F   dump every byte the app wrote to F, for inspecting which escape
+            sequences it emits (mouse tracking, alt screen, etc)
 """
 import os, sys, pty, select, struct, termios, fcntl, time, re
 
@@ -36,6 +38,9 @@ NOSSL = "--nossl" in sys.argv
 NOEXIT = "--noexit" in sys.argv
 if "--wait" in sys.argv:
     WAIT = float(sys.argv[sys.argv.index("--wait") + 1])
+RAW = None
+if "--raw" in sys.argv:
+    RAW = sys.argv[sys.argv.index("--raw") + 1]
 
 # Override with COPILOT_CMD to launch something other than the wrapper - needed
 # for unpatched-control runs, since the wrapper self-heals a pristine binary
@@ -199,6 +204,9 @@ def main():
     visible = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", visible)
     vis = len(visible.strip())
 
+    if RAW:
+        with open(RAW, "wb") as fh:
+            fh.write(buf)
     print("RESULT=%s t=%.1fs bytes=%d visible=%d" % (verdict, el, len(buf), vis))
     if "--screen" in sys.argv:
         print("--- screen ---")

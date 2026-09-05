@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/bash
 # GitHub Copilot CLI launcher with Termux/bionic compat patches.
 # Self-heals after `npm install -g` replaces the platform package.
 #
@@ -77,6 +77,7 @@ PTH_SRC="$SHIM_DIR/pthread_xlate.c"
 RENAME_PY="$SHIM_DIR/rename_imports.py"
 STRIP_PY="$SHIM_DIR/strip_verneed.py"
 PATCH_JS_PY="$SHIM_DIR/patch_js.py"
+PATCH_MOUSE_PY="$SHIM_DIR/patch_mouse.py"
 
 NODE_MODULES="$HOME/.npm-global/lib/node_modules"
 STUB_PKG="$NODE_MODULES/@github/copilot"
@@ -283,6 +284,27 @@ for pair in "$SHIM_LIB:$SHIM_SRC" "$GAI_LIB:$GAI_SRC" "$PTH_LIB:$PTH_SRC"; do
     fi
 done
 
+# --- mouse-scroll patch (Termux swipe -> wheel, not arrow keys) -----------
+#
+# Termux's terminal maps a fixed set of DECSET codes; its mouse tracking is
+# driven by the 1000/1002 bits. When the server-side TIMELINE_TOUCHUP flag is
+# on, copilot enables "any-event" tracking as mode 1003 ALONE, which Termux does
+# not map - so tracking stays off, and in the alternate screen Termux converts
+# finger swipes into DPAD_UP/DPAD_DOWN. Those arrows land in the prompt box, so
+# a swipe cycles prompt history instead of scrolling the transcript.
+#
+# patch_mouse.py adds 1002 alongside 1003. Independent bits, so terminals that
+# honour 1003 lose nothing, and copilot's own MOUSE_OFF already sends 1002l so
+# the terminal is not left reporting mouse events after exit. Re-applied here
+# because npm restores a pristine app.js on every upgrade.
+patch_mouse_js() {
+    local app="$1"
+    [ -f "$PATCH_MOUSE_PY" ] || return 0
+    [ -f "$app" ] || return 0
+    python3 "$PATCH_MOUSE_PY" "$app" >/dev/null 2>&1 || \
+        warn "WARN: mouse-scroll patch did not apply to $app (upstream constant changed?) - swipe may fall back to arrow keys"
+}
+
 # --- pick entry point ----------------------------------------------------
 
 ENTRY=""
@@ -290,9 +312,11 @@ if [ -f "$MUSL_PKG/index.js" ]; then
     # 1.0.73+ split package. Re-patch if npm replaced the runtime.
     runtime_is_patched || patch_musl_runtime || \
         warn "WARN: could not patch $MUSL_PKG runtime.node - expect a segfault"
+    patch_mouse_js "$MUSL_PKG/app.js"
     ENTRY="$MUSL_PKG/index.js"
 elif [ -f "$LEGACY_PKG/index.js" ]; then
     legacy_selfheal
+    patch_mouse_js "$LEGACY_PKG/app.js"
     if [ -f "$LEGACY_PKG/npm-loader.js" ]; then
         ENTRY="$LEGACY_PKG/npm-loader.js"
     else
@@ -352,5 +376,52 @@ fi
 if [ -z "${NODE_EXTRA_CA_CERTS:-}" ] && [ -f "${SSL_CERT_FILE:-}" ]; then
     export NODE_EXTRA_CA_CERTS="$SSL_CERT_FILE"
 fi
+
+# ---------------------------------------------------------------------------
+# Keep child processes on Termux-native binaries
+# ---------------------------------------------------------------------------
+# If copilot is launched from a shell running under glibc-runner (`grun`), PATH
+# starts with $PREFIX/glibc/bin and `bash`, `uname`, `ls` etc. resolve to GLIBC
+# builds. Our LD_PRELOAD is a BIONIC shim needing libm.so, which those binaries
+# then resolve from $PREFIX/glibc/lib/libm.so - a GNU ld script, not an ELF. So
+# every shell command copilot runs dies with:
+#
+#     error while loading shared libraries: .../glibc/lib/libm.so:
+#     invalid ELF header
+#
+# which surfaces in chat as "the bash environment is broken". Nothing is
+# actually wrong with copilot or with Termux; the two libcs simply cannot be
+# mixed in one process. Drop glibc entries so children get the Termux tools.
+TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+GLIBC_DIR="${GLIBC_PREFIX:-$TERMUX_PREFIX/glibc}"
+strip_glibc_from() {
+    # $1 = a colon-separated path list; echoes it without $GLIBC_DIR entries
+    local out="" part
+    local IFS=':'
+    for part in $1; do
+        [ -n "$part" ] || continue
+        case "$part" in
+            "$GLIBC_DIR"|"$GLIBC_DIR"/*) continue ;;
+        esac
+        out="${out:+$out:}$part"
+    done
+    printf '%s' "$out"
+}
+case ":$PATH:" in
+    *":$GLIBC_DIR/bin:"*|*":$GLIBC_DIR/"*)
+        PATH="$(strip_glibc_from "$PATH")"
+        case ":$PATH:" in
+            *":$TERMUX_PREFIX/bin:"*) ;;
+            *) PATH="${PATH:+$PATH:}$TERMUX_PREFIX/bin" ;;
+        esac
+        export PATH
+        ;;
+esac
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    LD_LIBRARY_PATH="$(strip_glibc_from "$LD_LIBRARY_PATH")"
+    if [ -n "$LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH; else unset LD_LIBRARY_PATH; fi
+fi
+# These only tell child shells they are inside grun; the shell tool is not.
+unset RUNNING_IN_GLIBC_RUNNER ENABLED_LIBTERMUX_EXEC_GLIBC 2>/dev/null || true
 
 exec /data/data/com.termux/files/usr/bin/node "$ENTRY" "$@"

@@ -213,6 +213,100 @@ is silently ignored with no warning at all.
 cannot A/B a settings change by pointing it at a scratch directory - it keeps
 reading `~/.copilot/settings.json`. Back that file up and edit it in place.
 
+### Swiping scrolls nothing - it cycles through prompt history instead
+
+Symptom: in the interactive TUI a finger swipe does not scroll the transcript.
+Instead the prompt box cycles through previously typed prompts, as if you were
+pressing Up and Down.
+
+That is exactly what is happening. Termux's terminal maps a fixed set of DECSET
+codes, and its mouse tracking is driven by the 1000/1002 bits. When the
+server-side `TIMELINE_TOUCHUP` feature flag is on, copilot enables "any-event"
+tracking as mode **1003 alone**:
+
+```
+MOUSE_ANY: "\x1B[?1003h\x1B[?1006h"
+```
+
+Termux does not map 1003, so tracking never turns on, and in the alternate
+screen Termux converts vertical swipes into `DPAD_UP`/`DPAD_DOWN` key presses.
+Those arrows land in the prompt box, which owns Up/Down for history.
+
+`shim/patch_mouse.py` adds mode 1002 alongside 1003. They are independent bits,
+so terminals that honour 1003 lose nothing, and copilot's own `MOUSE_OFF`
+already sends `1002l`, so the terminal is not left reporting mouse events after
+exit. The wrapper re-applies it on every launch, because npm restores a pristine
+`app.js` on each upgrade.
+
+Verify what copilot actually asks for:
+
+```bash
+python3 ~/.copilot-versions/pty_tui_test.py --wait 18 --raw "$PREFIX/tmp/c.raw"
+python3 -c 'import os,sys
+b=open(os.environ["PREFIX"]+"/tmp/c.raw","rb").read()
+for n,q in [("1002h",b"\x1b[?1002h"),("1003h",b"\x1b[?1003h"),("1002l",b"\x1b[?1002l")]:
+    print(n, b.count(q))'
+```
+
+`1002h 1` means the patch is live. (Use `$PREFIX/tmp`, not `/tmp` - `/tmp` is not
+writable on Termux. And `command grep` if your shell aliases `grep`.)
+
+Trade-off: with tracking active the terminal forwards taps to copilot, so
+Termux's own long-press text selection may behave differently inside copilot. To
+turn mouse support off entirely instead, put `"mouse": false` in
+`~/.copilot/settings.json` - but note that returns you to the arrow-key
+behaviour above.
+
+**Keyboard scrolling works regardless** (no patch needed). The transcript pane
+binds:
+
+| Keys | Action |
+|---|---|
+| `PageUp` / `PageDown` | scroll one screen |
+| `Ctrl+U` / `Ctrl+D` | scroll half a screen |
+| `Home` / `End` (or `g` / `G`) | jump to top / bottom |
+| `Up` / `Down`, `Ctrl+P` / `Ctrl+N`, `k` / `j` | one line |
+
+On a touch keyboard, add the keys you need to Termux's extra-keys row in
+`~/.termux/termux.properties`, then run `termux-reload-settings`:
+
+```
+extra-keys = [['ESC','/','-','HOME','UP','END','PGUP'], \
+              ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]
+```
+
+### "The bash environment is broken" / `libm.so: invalid ELF header`
+
+Every shell command copilot runs fails, and it reports something like *"the bash
+environment is broken (a corrupted libm.so)"*. Nothing is corrupted. This happens
+when copilot is launched from a shell running under **glibc-runner** (`grun`),
+which puts `$PREFIX/glibc/bin` first on `PATH`:
+
+```bash
+command -v bash        # /data/data/com.termux/files/usr/glibc/bin/bash  <- glibc
+echo "$RUNNING_IN_GLIBC_RUNNER"
+```
+
+Our `LD_PRELOAD` is a **bionic** shim that needs `libm.so`. A glibc binary
+resolves that from `$PREFIX/glibc/lib/libm.so`, which is a GNU ld script rather
+than an ELF object, so the loader rejects it. The two libcs cannot be mixed in
+one process.
+
+The wrapper now strips `$GLIBC_PREFIX` entries from `PATH` and `LD_LIBRARY_PATH`
+before exec, so children always get the Termux-native tools. If you hit this with
+an older wrapper, either re-run `./setup.sh --update` or launch copilot from a
+plain Termux shell.
+
+### `bad interpreter: /usr/bin/env` when running `copilot`
+
+Termux has no `/usr` at all, so a `#!/usr/bin/env bash` shebang fails with
+`bad interpreter: No such file or directory` - and confusingly, running it via
+`env` reports the *script* as missing rather than the interpreter. Every script
+here therefore uses an absolute `$PREFIX` shebang
+(`#!/data/data/com.termux/files/usr/bin/bash`), which is what `termux-fix-shebang`
+does. If you copy these scripts somewhere with a different Termux prefix (a
+secondary Android user, for instance), rewrite line 1 to match `$PREFIX`.
+
 ### "Failed to load native module: pty.node"
 The prebuild was wiped. Run `./setup.sh --update` to restore from backup.
 
@@ -229,7 +323,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → **1.0.80** (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
+- `@github/copilot` 1.0.45 → **1.0.83** (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 

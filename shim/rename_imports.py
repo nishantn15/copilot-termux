@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 """In-place .dynstr symbol renaming for scoping a module's libc imports to a shim.
 
 Renames UND symbol names inside .dynstr by overwriting the bytes in place. The
