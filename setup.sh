@@ -100,9 +100,22 @@ if [ "$UPDATE_MODE" = true ]; then
   # .dynstr import rename + patchelf --add-needed (see the wrapper header).
   # 1.0.76 verified working end to end: prompts, shell tools, MCP, resume, TUI.
   #
-  # The ceiling is therefore lifted (empty = no cap). Set COPILOT_MAX_VERSION to
-  # re-pin if a future release regresses.
-  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION:-}"
+  # CEILING RE-PINNED TO 1.0.84 (2026-09-20). Not a regression - a repackaging.
+  # From 1.0.85 the platform package ships ONLY a single ~167MB musl SEA binary:
+  # no prebuilds/*.node, no app.js, no index.js. Unpacked size tells the story:
+  #   1.0.83  310MB    1.0.84  320MB    1.0.85  167MB    1.0.86  167MB
+  # Nothing in this repo applies to that binary. It is a musl-DYNAMIC PIE
+  # (interpreter /lib/ld-musl-aarch64.so.1, NEEDED libc.musl-aarch64.so.1), so
+  # bionic cannot run it at all, and the .dynstr-rename trick has no .node to
+  # rename. Even given musl's loader and libc, it imports getaddrinfo, and musl
+  # reads /etc/resolv.conf at an ABSOLUTE path - which does not exist on Android
+  # and cannot be created without root, so DNS would fail. Supporting 1.0.85+
+  # needs a different approach entirely, not another patch.
+  #
+  # 1.0.84 is verified working end to end: TUI, headless prompts, shell tools,
+  # auth/TLS, MCP, swipe-scrolling. Raise with COPILOT_MAX_VERSION=x.y.z once a
+  # release ships a bionic-loadable module again (or set it empty for no cap).
+  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION-1.0.84}"
   if [ -z "$MAX_GOOD_VERSION" ]; then
     MAX_GOOD_VERSION="$LATEST_VERSION"
   fi
@@ -153,6 +166,22 @@ if [ "$UPDATE_MODE" = true ]; then
   else
     echo "✗ npm update failed"
     exit 1
+  fi
+
+  # The stub carries the real binaries as an optionalDependency, which npm SKIPS
+  # on Termux (its os is "linux", Termux reports "android"). So installing the
+  # stub alone upgrades the loader and leaves the OLD binaries in place. Install
+  # the platform package explicitly, at the SAME version, or the two halves drift.
+  MUSL_PKG_NAME="@github/copilot-linuxmusl-${ANDROID_ARCH#android-}"
+  if npm ls -g --depth=0 2>/dev/null | command grep -q "$MUSL_PKG_NAME"; then
+    echo ""
+    echo "▶ Installing $MUSL_PKG_NAME@$TARGET_VERSION (platform binaries)..."
+    if npm install -g --force "$MUSL_PKG_NAME@$TARGET_VERSION" 2>&1 | command grep -v "^npm warn using --force"; then
+      echo "✓ Platform package at $TARGET_VERSION"
+    else
+      echo "⚠ Could not install $MUSL_PKG_NAME@$TARGET_VERSION - binaries may be stale."
+      echo "  Retry manually: npm install -g --force $MUSL_PKG_NAME@$TARGET_VERSION"
+    fi
   fi
 
   # Step 3: Restore android prebuild (npm wipes it!)
@@ -466,8 +495,19 @@ fi
 if [ ! -d "$INSTALL_ROOT/prebuilds" ] && [ ! -d "$INSTALL_ROOT/native" ]; then
     # No binaries under the stub => split-package layout (1.0.73+).
     MUSL_PKG_NAME="@github/copilot-linuxmusl-${ANDROID_ARCH#android-}"
-    print_info "1.0.73+ layout: installing $MUSL_PKG_NAME (needs --force on Termux)"
-    if npm install -g --force "$MUSL_PKG_NAME" 2>&1 | command grep -v "^npm warn using --force"; then
+    # PIN to the stub's own version. Unpinned this resolves to @latest, and since
+    # 1.0.85 that is a musl SEA with no .node modules at all - pairing it with an
+    # older stub gives an install that cannot start, and the mismatch is not
+    # obvious from the error.
+    STUB_VERSION="$(node -p "require('$INSTALL_ROOT/package.json').version" 2>/dev/null || echo "")"
+    if [ -n "$STUB_VERSION" ]; then
+        MUSL_PKG_SPEC="$MUSL_PKG_NAME@$STUB_VERSION"
+    else
+        MUSL_PKG_SPEC="$MUSL_PKG_NAME"
+        print_warning "Could not read stub version; installing $MUSL_PKG_NAME unpinned"
+    fi
+    print_info "1.0.73+ layout: installing $MUSL_PKG_SPEC (needs --force on Termux)"
+    if npm install -g --force "$MUSL_PKG_SPEC" 2>&1 | command grep -v "^npm warn using --force"; then
         print_info "Platform package installed"
     else
         print_warning "Could not install $MUSL_PKG_NAME - copilot will not start."
