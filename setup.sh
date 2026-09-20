@@ -100,22 +100,25 @@ if [ "$UPDATE_MODE" = true ]; then
   # .dynstr import rename + patchelf --add-needed (see the wrapper header).
   # 1.0.76 verified working end to end: prompts, shell tools, MCP, resume, TUI.
   #
-  # CEILING RE-PINNED TO 1.0.84 (2026-09-20). Not a regression - a repackaging.
-  # From 1.0.85 the platform package ships ONLY a single ~167MB musl SEA binary:
-  # no prebuilds/*.node, no app.js, no index.js. Unpacked size tells the story:
-  #   1.0.83  310MB    1.0.84  320MB    1.0.85  167MB    1.0.86  167MB
-  # Nothing in this repo applies to that binary. It is a musl-DYNAMIC PIE
-  # (interpreter /lib/ld-musl-aarch64.so.1, NEEDED libc.musl-aarch64.so.1), so
-  # bionic cannot run it at all, and the .dynstr-rename trick has no .node to
-  # rename. Even given musl's loader and libc, it imports getaddrinfo, and musl
-  # reads /etc/resolv.conf at an ABSOLUTE path - which does not exist on Android
-  # and cannot be created without root, so DNS would fail. Supporting 1.0.85+
-  # needs a different approach entirely, not another patch.
+  # CEILING LIFTED AGAIN 2026-09-20, after SEA support landed.
   #
-  # 1.0.84 is verified working end to end: TUI, headless prompts, shell tools,
-  # auth/TLS, MCP, swipe-scrolling. Raise with COPILOT_MAX_VERSION=x.y.z once a
-  # release ships a bionic-loadable module again (or set it empty for no cap).
-  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION-1.0.84}"
+  # From 1.0.85 the platform package ships ONLY a ~167MB musl Node SEA and three
+  # text files (unpacked size: 1.0.84=320MB, 1.0.85=167MB). bionic cannot execute
+  # that binary - musl-DYNAMIC PIE wanting /lib/ld-musl-aarch64.so.1 - so this was
+  # briefly pinned to 1.0.84 as unsupportable.
+  #
+  # That was wrong. The app inside is still plain JS + musl addons, carried as a
+  # gzipped tar asset (copilot.tgz) that the SEA bootstrap unpacks at first run.
+  # Compression is why grepping the binary for app strings or ELF headers finds
+  # nothing and it looks monolithic. shim/extract_sea.py pulls that tarball out,
+  # restoring the pre-1.0.85 layout, after which every existing patch applies.
+  # The wrapper does this automatically, once per version.
+  #
+  # 1.0.86 verified end to end on bionic: TUI 4/4 exit 0 full render, headless
+  # prompts, shell tools, auth/TLS, and swipe-scrolling (1002h still emitted).
+  # Re-pin with COPILOT_MAX_VERSION=x.y.z if a future release changes the SEA
+  # asset layout - extract_sea.py fails loudly rather than silently in that case.
+  MAX_GOOD_VERSION="${COPILOT_MAX_VERSION-}"
   if [ -z "$MAX_GOOD_VERSION" ]; then
     MAX_GOOD_VERSION="$LATEST_VERSION"
   fi
@@ -236,7 +239,8 @@ if [ "$UPDATE_MODE" = true ]; then
   # gai_xlate.c/pthread_xlate.c/rename_imports.py are what fix the 1.0.61+ and
   # TUI segfaults - without them the wrapper cannot self-heal at all.
   for f in bionic_shim.c strip_verneed.py patch_js.py \
-           gai_xlate.c pthread_xlate.c rename_imports.py patch_mouse.py; do
+           gai_xlate.c pthread_xlate.c rename_imports.py patch_mouse.py \
+           extract_sea.py; do
     if [ -f "$REPO_DIR/shim/$f" ] && { [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; }; then
       cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
       echo "✓ Synced $f from repo (your $f was stale or missing)"
@@ -946,7 +950,8 @@ if [ ! -f "$REPO_DIR/shim/bionic_shim.c" ]; then
 fi
 SYNCED=0
 for f in bionic_shim.c strip_verneed.py patch_js.py \
-         gai_xlate.c pthread_xlate.c rename_imports.py patch_mouse.py; do
+         gai_xlate.c pthread_xlate.c rename_imports.py patch_mouse.py \
+         extract_sea.py; do
   if [ ! -f "$SHIM_DIR/$f" ] || ! cmp -s "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"; then
     cp -f "$REPO_DIR/shim/$f" "$SHIM_DIR/$f"
     SYNCED=$((SYNCED+1))

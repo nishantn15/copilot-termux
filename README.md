@@ -326,7 +326,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → **1.0.84** (the ceiling; see "1.0.85+ cannot work here") (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
+- `@github/copilot` 1.0.45 → **1.0.86** (1.0.85+ needs `shim/extract_sea.py`; see "1.0.85+ ships a SEA") (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 
@@ -340,81 +340,100 @@ Once the installation is complete, you can start the GitHub Copilot CLI by runni
 copilot
 ```
 
-## NOT SOLVABLE BY THIS REPO: 1.0.85+ is a single musl binary
+## SOLVED: 1.0.85+ ships a SEA, and the app is a tarball inside it
 
-**`setup.sh` pins the ceiling to 1.0.84.** This is not a regression to debug -
-upstream repackaged, and the thing this repo patches no longer exists.
+From 1.0.85 the platform package contains four files: a ~167MB `copilot` binary,
+`package.json`, `README.md`, `LICENSE.md`. No `app.js`, no `prebuilds/*.node`.
 
-From 1.0.85 the platform package ships exactly four files: `copilot`,
-`package.json`, `README.md`, `LICENSE.md`. No `prebuilds/*.node`, no `app.js`, no
-`index.js`. Unpacked size tells the story:
-
-| Version | Unpacked | Layout |
-|---|---|---|
-| 1.0.83 | 310 MB | `app.js` + `runtime.node` + `cli-native.node` (+ a SEA alongside) |
-| 1.0.84 | 320 MB | same - **last patchable version** |
-| 1.0.85 | 167 MB | SEA binary only |
-| 1.0.86 | 167 MB | SEA binary only |
-
-```bash
+```
 $ file .../copilot-linuxmusl-arm64/copilot
 ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked,
 interpreter /lib/ld-musl-aarch64.so.1, stripped
-$ readelf -d .../copilot | grep NEEDED
- (NEEDED)  Shared library: [libc.musl-aarch64.so.1]
 ```
 
-Three independent blockers, in increasing order of difficulty:
+bionic cannot execute that: it is a musl-*dynamic* PIE, and `/lib` is not
+writable without root. It is also a dead end to chase directly, because it
+imports `getaddrinfo` and musl reads `/etc/resolv.conf` at an **absolute** path
+with no env override, which Android does not have and you cannot create.
 
-1. **The loader will not pick it.** `npm-loader.js` gates on
-   `process.platform === "linux"`; Termux reports `android`, so it resolves
-   `@github/copilot-android-arm64`, finds nothing, and exits. Trivially bypassed
-   by running the binary directly - this one is not the problem.
-2. **bionic cannot run it.** It is a musl-*dynamic* PIE, so it needs
-   `/lib/ld-musl-aarch64.so.1` and `libc.musl-aarch64.so.1`. Neither exists on
-   Android, `/lib` is not writable without root, and musl is not in the Termux
-   repos. You can sidestep the absolute interpreter path by invoking the loader
-   explicitly (`ld-musl-aarch64.so.1 --library-path <dir> ./copilot`), so this is
-   awkward rather than fatal - *if* you can obtain musl for aarch64.
-3. **DNS would still fail, and this is the real wall.** The binary imports
-   `getaddrinfo`/`freeaddrinfo` from libc, so name resolution goes through musl,
-   and musl reads `/etc/resolv.conf` at an **absolute** path with no env-var
-   override (unlike glibc). Android has no `/etc/resolv.conf` - `/etc` is a
-   symlink to `/system/etc` - and you cannot create one without root. With no
-   resolv.conf musl falls back to `127.0.0.1`, so every request to
-   `api.githubcopilot.com` dies. Verified by symbol table, not assumed.
+**But you never need to run it.** It is a Node SEA, and its bootstrap does:
 
-Note the irony: under a real musl libc the ABI bugs this repo exists to fix
-(`pthread_mutexattr_t` width, `addrinfo` field order) simply vanish, because it
-would be musl talking to musl. The blocker moved from ABI to the filesystem.
+```js
+let e = ci.getRawAsset("copilot.tgz"), t = Buffer.from(e); await mkdir(...)
+```
 
-So supporting 1.0.85+ needs a different approach, not another patch - a musl
-sysroot with a resolver that does not depend on `/etc`, or upstream shipping a
-bionic/Android target (see "Upstream issues worth filing"). Until then:
+The app ships as a **gzipped tar asset** which the SEA unpacks at first run.
+Extract that tarball and the pre-1.0.85 layout is back exactly as it was -
+`app.js` (7.7MB), `index.js`, `prebuilds/linuxmusl-arm64/{runtime,cli-native}.node` -
+so every patch in this repo applies unchanged, running under **Termux's own
+bionic node**. No musl, no glibc, no proot.
+
+`shim/extract_sea.py` does the extraction and the wrapper calls it automatically,
+once per version (~3s, ~154MB) into `~/.copilot-versions/sea-<version>/`. It
+deliberately does not unpack into the npm package directory, because the tarball
+contains its own `package.json` and overwriting the platform one there would
+confuse npm about what is installed. The wrapper then points `MUSL_PKG` at the
+extracted tree, so self-heal, the `.dynstr` renames and the mouse patch all work
+with no further changes.
+
+### Why this looked impossible at first
+
+Worth recording, because the same trap will recur. Searching the binary finds
+**nothing**: zero embedded ELF headers, and zero hits for `githubcopilot`,
+`renderMarkdown`, `MOUSE_ANY` or any other app string, in ASCII or UTF-16. That
+is entirely consistent with "the app is statically linked in and unreachable",
+which is the wrong conclusion - the payload is simply compressed. The tell was
+searching for the *bootstrap's own* asset call rather than for app content:
 
 ```bash
-./setup.sh --update                      # holds at 1.0.84, by design
-COPILOT_ALLOW_BROKEN=1 ./setup.sh --update   # force it and watch it fail
-COPILOT_MAX_VERSION=1.0.90 ./setup.sh --update   # raise once upstream ships a .node again
+strings -a copilot | grep -n 'getRawAsset'     # -> getRawAsset("copilot.tgz")
 ```
 
-### 1.0.84 also needs `libm` just to load
+Absence of strings is not evidence of absence of code. Look for the loader, not
+the payload.
 
-New in 1.0.84: pristine `cli-native.node` will not `dlopen` at all -
+### New in 1.0.85+: `atexit`
+
+One genuinely new blocker, the same family as 1.0.84's `expf`:
 
 ```
-dlopen failed: cannot locate symbol "expf" referenced by "cli-native.node"
+dlopen failed: cannot locate symbol "atexit" referenced by "runtime.node"
 ```
 
-musl folds libm into libc, bionic keeps `libm.so` separate, and the module ships
-with only `libc.so` in `NEEDED`. The wrapper already adds `libm.so`, so this is
-covered - but it means the `libm` part of the patch is now load-bearing on its
-own. Measured on 1.0.84: pristine module 3/3 hard failure at 0.6 s; with only
-`libm`/`libdl` added and the symbol renames left off, 3/3 **pass** with a full
-render. So on this build the `pthread`/`gai` rename is no longer demonstrably
-required, where it was on 1.0.78 through 1.0.83. It is kept as defence: the
-8-byte overwrite still happens, it just lands somewhere harmless in this
-particular build, and which register it hits changes with every compile.
+bionic implements `atexit` in the static CRT, so `libc.so` does not export it,
+and the copy linked into every shared object is `LOCAL HIDDEN`:
+
+```bash
+$ readelf -s libbionic_shim.so | awk '$8=="atexit"'
+  19: 000000000000357c  28 FUNC  LOCAL  HIDDEN  12 atexit
+```
+
+That hidden copy is why `LD_PRELOAD` cannot supply it, and why the shim cannot
+define it either - linking fails with `duplicate symbol: atexit ... crtbegin_so.c`.
+The `.dynstr` rename is the only mechanism that fits, and `atexit` -> `Atexit`
+is conveniently the same length. `Atexit` in `pthread_xlate.c` forwards to
+`__cxa_atexit` (which bionic does export) through a trampoline, since the
+callback signatures differ (`void(*)(void)` vs `void(*)(void*)`).
+
+### Verification on 1.0.86
+
+| Check | Result |
+|---|---|
+| `--version` | 1.0.86, first launch 6.8s (incl. extraction), then 1.0s |
+| TUI | 3/3 exit 0, full render (`visible` 1551-1651) |
+| Headless + shell tools | `aarch64` / `v24.14.1`, credits billed |
+| Swipe-scroll | `?1002h` emitted, `?1002l` on exit |
+| Unpatched control | 3/3 **EXIT 1** in <1s (`dlopen` fails on `atexit`) |
+| Idempotency | 5 `NEEDED`, 5 unique; no re-extraction on relaunch |
+
+To rebuild an unpatched control for a future version:
+
+```bash
+python3 shim/extract_sea.py \
+  ~/.npm-global/lib/node_modules/@github/copilot-linuxmusl-arm64/copilot /tmp/ctrl
+ln -sfn linuxmusl-arm64 /tmp/ctrl/prebuilds/linux-arm64
+# then run node /tmp/ctrl/index.js with LD_PRELOAD=libbionic_shim.so and SSL_CERT_FILE
+```
 
 ## SOLVED: "auth failed" (no fetch) (fixed 2026-08-05)
 

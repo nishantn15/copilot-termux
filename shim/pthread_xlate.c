@@ -260,3 +260,37 @@ int Pthread_mutexattr_getpshared(const void *musl_attr, int *out) {
     pthread_mutexattr_t wide = widen(musl_attr);
     return f(&wide, out);
 }
+
+/* ---------------------------------------------------------------------------
+ * Atexit: not a width problem, an AVAILABILITY problem.
+ *
+ * bionic implements atexit() in the static CRT (crtbegin_so.o), so
+ * /system/lib64/libc.so does not export it at all, and the copy linked into
+ * every shared object is LOCAL HIDDEN:
+ *     readelf -s libbionic_shim.so | awk '$8=="atexit"'
+ *     19: ... FUNC LOCAL HIDDEN ... atexit
+ * That hidden copy is why LD_PRELOAD cannot supply it - the preload exports
+ * nothing by that name - and why the shim cannot define it either: the link
+ * fails with "duplicate symbol: atexit ... defined at crtbegin_so.c".
+ *
+ * musl and glibc both export atexit, and from 1.0.85 runtime.node imports it,
+ * so on bionic the dlopen fails with:
+ *     cannot locate symbol "atexit" referenced by "runtime.node"
+ *
+ * The .dynstr rename is the only mechanism that works here, and atexit ->
+ * Atexit is the same length, which the rename requires. Forward to
+ * __cxa_atexit, which bionic DOES export. The callback signatures differ
+ * (void(*)(void) vs void(*)(void*)), so carry the original function pointer as
+ * the argument and unpack it in a trampoline. A NULL dso handle registers
+ * against the main program, which is what a process-wide atexit means.
+ * --------------------------------------------------------------------------- */
+extern int __cxa_atexit(void (*func)(void *), void *arg, void *dso);
+
+static void atexit_trampoline(void *fn) {
+    ((void (*)(void))fn)();
+}
+
+int Atexit(void (*func)(void)) {
+    if (!func) return -1;
+    return __cxa_atexit(atexit_trampoline, (void *)func, NULL);
+}

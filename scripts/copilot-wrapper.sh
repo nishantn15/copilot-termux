@@ -78,6 +78,7 @@ RENAME_PY="$SHIM_DIR/rename_imports.py"
 STRIP_PY="$SHIM_DIR/strip_verneed.py"
 PATCH_JS_PY="$SHIM_DIR/patch_js.py"
 PATCH_MOUSE_PY="$SHIM_DIR/patch_mouse.py"
+EXTRACT_SEA_PY="$SHIM_DIR/extract_sea.py"
 
 NODE_MODULES="$HOME/.npm-global/lib/node_modules"
 STUB_PKG="$NODE_MODULES/@github/copilot"
@@ -100,7 +101,13 @@ PTH_SYMS="pthread_mutexattr_init pthread_mutexattr_settype pthread_mutexattr_des
 # path still segfaulted when only runtime.node was patched.
 COND_SYMS="pthread_condattr_init pthread_condattr_destroy pthread_condattr_setclock pthread_condattr_setpshared pthread_condattr_getclock pthread_condattr_getpshared pthread_cond_init"
 MUTEX_EXTRA_SYMS="pthread_mutexattr_gettype pthread_mutexattr_setpshared pthread_mutexattr_getpshared"
-ALL_XLATE_SYMS="$GAI_SYMS $PTH_SYMS $COND_SYMS $MUTEX_EXTRA_SYMS"
+# atexit is an AVAILABILITY problem, not a width one: bionic implements it in the
+# static CRT so libc.so does not export it, and the copy in every .so is LOCAL
+# HIDDEN - so LD_PRELOAD cannot supply it and the shim cannot even define it
+# (duplicate symbol against crtbegin_so.o). runtime.node imports it from 1.0.85.
+# atexit -> Atexit is the same length, which the .dynstr rename requires.
+AVAIL_SYMS="atexit"
+ALL_XLATE_SYMS="$GAI_SYMS $PTH_SYMS $COND_SYMS $MUTEX_EXTRA_SYMS $AVAIL_SYMS"
 
 # Echo the subset of $ALL_XLATE_SYMS that $1 actually imports (UND in .dynsym),
 # in either the original or already-renamed spelling.
@@ -304,6 +311,38 @@ patch_mouse_js() {
     python3 "$PATCH_MOUSE_PY" "$app" >/dev/null 2>&1 || \
         warn "WARN: mouse-scroll patch did not apply to $app (upstream constant changed?) - swipe may fall back to arrow keys"
 }
+
+# --- 1.0.85+ SEA-only platform package ------------------------------------
+#
+# From 1.0.85 the platform package ships ONLY a ~167MB musl Node SEA plus three
+# text files: no app.js, no index.js, no prebuilds/*.node. bionic cannot execute
+# that binary at all - it is a musl-DYNAMIC PIE wanting /lib/ld-musl-aarch64.so.1.
+#
+# But the app inside is still ordinary JS plus musl-built addons. The SEA carries
+# it as a GZIPPED TAR ASSET named copilot.tgz which its bootstrap unpacks at first
+# run. Because that payload is compressed, grepping the binary for app strings or
+# for embedded ELF headers finds nothing, which makes it look monolithic and
+# unpatchable. It is not: extract the tarball and the pre-1.0.85 layout is back,
+# so everything below (dynstr renames, libm, the mouse patch) applies unchanged.
+#
+# We extract rather than letting the SEA self-extract, because we can never run it.
+# Extraction is once per version (~3s, ~154MB) into ~/.copilot-versions/sea-<ver>,
+# NOT into the npm package dir - overwriting the platform package.json there would
+# confuse npm about what is installed.
+if [ ! -f "$MUSL_PKG/index.js" ] && [ -f "$MUSL_PKG/copilot" ] && [ -f "$EXTRACT_SEA_PY" ]; then
+    SEA_VER="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+               "$MUSL_PKG/package.json" 2>/dev/null || echo unknown)"
+    SEA_DIR="$HOME/.copilot-versions/sea-$SEA_VER"
+    if ! python3 "$EXTRACT_SEA_PY" "$MUSL_PKG/copilot" "$SEA_DIR" \
+            --check --version "$SEA_VER" >/dev/null 2>&1; then
+        warn "SEA package detected ($SEA_VER): unpacking the app once, this takes a few seconds"
+        python3 "$EXTRACT_SEA_PY" "$MUSL_PKG/copilot" "$SEA_DIR" --version "$SEA_VER" || \
+            warn "ERROR: could not unpack the app from $MUSL_PKG/copilot - copilot cannot start"
+    fi
+    if [ -f "$SEA_DIR/index.js" ]; then
+        MUSL_PKG="$SEA_DIR"      # everything downstream now sees the old layout
+    fi
+fi
 
 # --- pick entry point ----------------------------------------------------
 
