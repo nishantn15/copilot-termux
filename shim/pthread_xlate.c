@@ -294,3 +294,66 @@ int Atexit(void (*func)(void)) {
     if (!func) return -1;
     return __cxa_atexit(atexit_trampoline, (void *)func, NULL);
 }
+
+/* ---------------------------------------------------------------------------
+ * Sigaction: struct sigaction has a DIFFERENT FIELD ORDER on bionic LP64.
+ *
+ *   musl (aarch64)                       bionic (LP64, __SIGACTION_BODY)
+ *   0x00 handler                         0x00 int sa_flags
+ *   0x08 sigset_t sa_mask  (128 bytes)   0x08 handler
+ *   0x88 int sa_flags                    0x10 sigset_t sa_mask  (8 bytes)
+ *   0x90 sa_restorer                     0x18 sa_restorer
+ *
+ * A musl-built module passing its struct straight to bionic's sigaction() gets
+ * its handler read from musl's sa_mask, and its flags from the low half of the
+ * handler pointer. From 1.0.91 runtime.node installs a SIGILL handler at load
+ * (a CPU feature probe, recovered with sigsetjmp/siglongjmp), so strace shows:
+ *
+ *   rt_sigaction(SIGILL, {sa_handler=0xfffffffffffffb27, ...
+ *
+ * 0xfffffffffffffb27 is not random: it is sigfillset() minus SIGILL, SIGTRAP,
+ * SIGBUS, SIGFPE and SIGSEGV - the probe's mask, read as a code address. The
+ * first SIGILL then jumps there and the process dies with SIGBUS.
+ *
+ * Translate both directions. Signal numbers, flag bits, siginfo_t and the
+ * ucontext passed to the handler are all kernel-defined and identical, so only
+ * the struct layout needs converting. bionic sets up its own restorer, so drop
+ * SA_RESTORER and never pass musl's restorer through. bionic's sigset_t holds
+ * signals 1-64, which covers every signal Linux delivers, so copying the low 8
+ * bytes of musl's 128-byte mask loses nothing.
+ * --------------------------------------------------------------------------- */
+#include <signal.h>
+#include <string.h>
+
+struct musl_sigaction {
+    void *handler;
+    unsigned long mask[128 / sizeof(unsigned long)];
+    int flags;
+    void (*restorer)(void);
+};
+
+#ifndef SA_RESTORER
+#define SA_RESTORER 0x04000000
+#endif
+
+int Sigaction(int sig, const struct musl_sigaction *act, struct musl_sigaction *old) {
+    struct sigaction b, ob;
+    struct sigaction *bp = NULL;
+    if (act) {
+        memset(&b, 0, sizeof b);
+        b.sa_handler = (void (*)(int))act->handler;
+        memcpy(&b.sa_mask, act->mask, sizeof b.sa_mask);
+        b.sa_flags = act->flags & ~SA_RESTORER;
+        bp = &b;
+    }
+    memset(&ob, 0, sizeof ob);
+    int rc = sigaction(sig, bp, old ? &ob : NULL);
+    if (rc == 0 && old) {
+        memset(old, 0, sizeof *old);
+        old->handler = (void *)ob.sa_handler;
+        memcpy(old->mask, &ob.sa_mask, sizeof ob.sa_mask);
+        old->flags = ob.sa_flags;
+        old->restorer = NULL;
+    }
+    return rc;
+}

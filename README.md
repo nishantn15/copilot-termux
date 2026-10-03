@@ -326,7 +326,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → **1.0.86** (1.0.85+ needs `shim/extract_sea.py`; see "1.0.85+ ships a SEA") (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
+- `@github/copilot` 1.0.45 → **1.0.91** (1.0.85+ needs `shim/extract_sea.py`; 1.0.91+ needs the `Sigaction` translator) (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 
@@ -414,6 +414,46 @@ The `.dynstr` rename is the only mechanism that fits, and `atexit` -> `Atexit`
 is conveniently the same length. `Atexit` in `pthread_xlate.c` forwards to
 `__cxa_atexit` (which bionic does export) through a trampoline, since the
 callback signatures differ (`void(*)(void)` vs `void(*)(void*)`).
+
+### New in 1.0.91: `struct sigaction` field order
+
+1.0.91 crashed with SIGBUS (exit 135, no output) the moment `runtime.node`
+loaded. `strace -e trace=rt_sigaction` shows why:
+
+```
+rt_sigaction(SIGILL, {sa_handler=0xfffffffffffffb27, ...
+```
+
+The module installs a SIGILL handler at load time to probe CPU features, and the
+kernel is given junk as the handler address. The field order differs:
+
+| offset | musl (aarch64) | bionic (LP64) |
+|---|---|---|
+| 0x00 | handler | `int sa_flags` |
+| 0x08 | `sa_mask` (128 bytes) | handler |
+| 0x10 | | `sa_mask` (8 bytes) |
+
+bionic reads the handler out of musl's signal mask. `0xfffffffffffffb27` is that
+mask: all bits set except SIGILL, SIGTRAP, SIGBUS, SIGFPE and SIGSEGV. The first
+probe jumps there. `Sigaction` in `pthread_xlate.c` converts both directions via
+the same `.dynstr` rename (`sigaction` -> `Sigaction`, same length). Afterwards
+strace shows a real handler and `sa_mask=~[ILL TRAP BUS FPE SEGV]`.
+
+A/B on 1.0.91 `runtime.node`, everything else patched: without the `sigaction`
+rename 3/3 SIGBUS, with it 3/3 load.
+
+**Wrapper bug found on the way.** `patch_one_node` passed every known symbol,
+including ones already renamed, to `rename_imports.py --check`. That reports an
+already-renamed name as `MISSING` and fails, and the wrapper then skipped the
+rename silently. So a tree patched by an older wrapper could never pick up a
+newly added symbol. It now passes only names still under their original
+spelling.
+
+### 1.0.91 verification
+
+TUI 4/4 exit 0, full render (`visible` 1692-2122); headless shell tools; swipe
+fix (`?1002h`) live; fresh extraction 4.2 s then 0.8 s per launch; 5 `NEEDED` /
+5 unique on both modules.
 
 ### Verification on 1.0.86
 

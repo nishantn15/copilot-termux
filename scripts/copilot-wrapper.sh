@@ -107,7 +107,13 @@ MUTEX_EXTRA_SYMS="pthread_mutexattr_gettype pthread_mutexattr_setpshared pthread
 # (duplicate symbol against crtbegin_so.o). runtime.node imports it from 1.0.85.
 # atexit -> Atexit is the same length, which the .dynstr rename requires.
 AVAIL_SYMS="atexit"
-ALL_XLATE_SYMS="$GAI_SYMS $PTH_SYMS $COND_SYMS $MUTEX_EXTRA_SYMS $AVAIL_SYMS"
+# struct sigaction has a different FIELD ORDER on bionic LP64 (sa_flags first,
+# 8-byte mask) than musl (handler first, 128-byte mask). Passed through as-is,
+# bionic reads the handler out of musl's mask. From 1.0.91 runtime.node installs
+# a SIGILL handler at load for a CPU feature probe, so the first probe jumps to
+# the mask value and dies. Sigaction in pthread_xlate.c converts both ways.
+SIG_SYMS="sigaction"
+ALL_XLATE_SYMS="$GAI_SYMS $PTH_SYMS $COND_SYMS $MUTEX_EXTRA_SYMS $AVAIL_SYMS $SIG_SYMS"
 
 # Echo the subset of $ALL_XLATE_SYMS that $1 actually imports (UND in .dynsym),
 # in either the original or already-renamed spelling.
@@ -162,6 +168,19 @@ patch_one_node() {
     local elf="$1" syms
     [ -f "$elf" ] || return 0          # module absent in this version, fine
     syms="$(imported_xlate_syms "$elf")"
+    # Rename only what is still under its ORIGINAL name. imported_xlate_syms
+    # matches either spelling, and rename_imports.py --check reports an
+    # already-renamed name as MISSING and fails - so passing the full set made
+    # the wrapper skip the rename entirely the moment a module was partly done.
+    # That silently blocked every newly added symbol (sigaction, 1.0.91) on any
+    # tree patched by an older wrapper.
+    local have pending="" s
+    have=$(readelf --dyn-syms -W "$elf" 2>/dev/null | command grep ' UND ' \
+           | awk '{print $8}' | sed 's/@.*//' | sort -u)
+    for s in $syms; do
+        printf '%s\n' "$have" | command grep -qx "$s" && pending="$pending $s"
+    done
+    syms="${pending# }"
     if [ -n "$syms" ]; then
         if python3 "$RENAME_PY" --check "$elf" $syms >/dev/null 2>&1; then
             python3 "$RENAME_PY" "$elf" $syms >/dev/null 2>&1 || {
@@ -215,7 +234,8 @@ runtime_is_patched() {
         [ -f "$f" ] || continue
         readelf -d "$f" 2>/dev/null | command grep -q 'libpthread_xlate\.so' || return 1
         readelf --dyn-syms -W "$f" 2>/dev/null | command grep ' UND ' | awk '{print $8}' \
-            | command grep -q -e '^pthread_mutexattr' -e '^pthread_condattr' && return 1
+            | command grep -q -e '^pthread_mutexattr' -e '^pthread_condattr' \
+                              -e '^atexit$' -e '^atexit@' -e '^sigaction$' -e '^sigaction@' && return 1
     done
     return 0
 }
