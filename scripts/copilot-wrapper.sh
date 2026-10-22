@@ -327,6 +327,12 @@ done
 patch_mouse_js() {
     local app="$1"
     [ -f "$PATCH_MOUSE_PY" ] || return 0
+    # From 1.0.102 app.js is a ~44KB stub and the real code (including the
+    # MOUSE_ANY constant) lives in cli-main.js next to it. Patch whichever file
+    # actually holds the app; fall back to app.js for older layouts.
+    if [ -f "$(dirname "$app")/cli-main.js" ]; then
+        app="$(dirname "$app")/cli-main.js"
+    fi
     [ -f "$app" ] || return 0
     python3 "$PATCH_MOUSE_PY" "$app" >/dev/null 2>&1 || \
         warn "WARN: mouse-scroll patch did not apply to $app (upstream constant changed?) - swipe may fall back to arrow keys"

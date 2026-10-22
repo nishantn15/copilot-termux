@@ -326,7 +326,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Add to ~/.bashrc
 - Termux 0.118+ on Android 13/14/15
 - ARM64 (aarch64) devices
 - Node.js v24+/v25+
-- `@github/copilot` 1.0.45 → **1.0.91** (1.0.85+ needs `shim/extract_sea.py`; 1.0.91+ needs the `Sigaction` translator) (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
+- `@github/copilot` 1.0.45 → **1.0.102** (1.0.85+ needs `shim/extract_sea.py`; 1.0.91+ needs the `Sigaction` translator) (1.0.46+ requires Termux `clang`, `patchelf`, `python3`, `pyelftools`, `ca-certificates`, and `libunwind.a` from `ndk-sysroot`)
 
 ## License
 
@@ -448,6 +448,24 @@ already-renamed name as `MISSING` and fails, and the wrapper then skipped the
 rename silently. So a tree patched by an older wrapper could never pick up a
 newly added symbol. It now passes only names still under their original
 spelling.
+
+### 1.0.102: app code moved to `cli-main.js`
+
+From 1.0.102 `app.js` is a ~44KB stub and the real application code lives in
+`cli-main.js` (8.3MB) next to it. The `MOUSE_ANY` constant is unchanged, so the
+swipe-scroll fix still works, but it has to target the new file. The wrapper now
+patches `cli-main.js` when present and falls back to `app.js` for older layouts.
+`MOUSE_OFF` became a variable that clears 1002 along with several other mouse
+modes, so teardown stays symmetric.
+
+Native audit, 1.0.102 vs 1.0.91: no new hazard class. New imports bionic lacks
+are all `WEAK` (BoringSSL memory hooks, zstd tracing). `pthread_sigmask` takes a
+`sigset_t` (musl 128 bytes, bionic 8), but bionic only touches the first 8, so it
+is safe for the same reason as `sigprocmask`.
+
+Verified: TUI 3/3 exit 0 full render, headless shell tools, `?1002h` on start
+and `?1002l` on exit, fresh extraction 5.3s then 0.9s per launch, 5 `NEEDED` /
+5 unique, pristine control fails (`cannot locate symbol "pow"`).
 
 ### 1.0.91 verification
 
